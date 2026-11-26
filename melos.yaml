@@ -1,0 +1,56 @@
+name: local_remote_synchronization_workspace
+
+repository: https://github.com/your-org/local-remote-synchronization
+
+packages:
+  - packages/*
+  - examples/*
+
+sdkPath: auto
+
+command:
+  bootstrap:
+    usePubspecOverrides: true
+
+scripts:
+  # ─── Analysis ─────────────────────────────────────────────────────────────
+  analyze:
+    run: melos exec -- dart analyze .
+    description: Run static analysis on all packages.
+
+  # ─── Formatting ───────────────────────────────────────────────────────────
+  format:
+    run: melos exec -- dart format . --set-exit-if-changed
+    description: Check formatting on all packages (fails on unformatted files).
+
+  format:fix:
+    run: melos exec -- dart format .
+    description: Auto-format all Dart files in all packages.
+
+  # ─── Tests ────────────────────────────────────────────────────────────────
+  test:
+    run: melos exec --fail-fast -- dart test
+    description: Run all tests across all packages.
+    select-package:
+      flutter: false # run only pure Dart packages; override per-package when needed
+
+  test:flutter:
+    run: melos exec --fail-fast -- flutter test
+    description: Run Flutter tests across packages that require the Flutter SDK.
+    select-package:
+      flutter: true
+
+  # ─── Coverage ─────────────────────────────────────────────────────────────
+  coverage:
+    run: melos exec -- dart test --coverage=coverage
+    description: Collect test coverage for all packages.
+
+  # ─── Clean ────────────────────────────────────────────────────────────────
+  clean:
+    run: melos exec -- dart run build_runner clean
+    description: Clean generated files across all packages.
+
+  # ─── Publish dry-run ──────────────────────────────────────────────────────
+  publish:dry:
+    run: melos exec -- dart pub publish --dry-run
+    description: Dry-run publish check for all packages.

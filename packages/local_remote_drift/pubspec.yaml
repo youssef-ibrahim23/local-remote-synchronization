@@ -1,0 +1,31 @@
+name: local_remote_drift
+description: >-
+  Drift (formerly Moor) implementation of LocalStorageAdapter for the
+  local_remote_synchronization ecosystem. Provides type-safe offline-first
+  local persistence using Drift on Android, iOS, macOS, and desktop.
+version: 0.1.0
+homepage: https://github.com/your-org/local-remote-synchronization
+repository: https://github.com/your-org/local-remote-synchronization
+issue_tracker: https://github.com/your-org/local-remote-synchronization/issues
+
+environment:
+  sdk: ">=3.3.0 <4.0.0"
+  flutter: ">=3.19.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  local_remote_synchronization:
+    path: ../local_remote_synchronization
+  drift: ^2.21.0
+  sqlite3_flutter_libs: ^0.5.26
+  path_provider: ^2.1.5
+  path: ^1.9.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^5.0.0
+  drift_dev: ^2.21.0
+  build_runner: ^2.4.13
+  mocktail: ^1.0.4

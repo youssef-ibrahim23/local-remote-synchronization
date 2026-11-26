@@ -1,0 +1,38 @@
+# .gitignore — Local Remote Synchronization Monorepo
+
+# ─── Dart / Flutter ──────────────────────────────────────────────────────────
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+build/
+pubspec.lock
+**/pubspec.lock
+**/.dart_tool/
+**/build/
+
+# ─── Melos ───────────────────────────────────────────────────────────────────
+.melos_tool/
+**/pubspec_overrides.yaml
+
+# ─── Generated code ──────────────────────────────────────────────────────────
+*.g.dart
+*.freezed.dart
+*.mocks.dart
+**/generated/
+
+# ─── Coverage ────────────────────────────────────────────────────────────────
+**/coverage/
+lcov.info
+
+# ─── IDE ─────────────────────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.iml
+
+# ─── OS ──────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ─── Logs ────────────────────────────────────────────────────────────────────
+*.log

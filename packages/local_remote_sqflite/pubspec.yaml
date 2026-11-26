@@ -1,0 +1,27 @@
+name: local_remote_sqflite
+description: >-
+  sqflite implementation of LocalStorageAdapter for the
+  local_remote_synchronization ecosystem. Provides offline-first local
+  persistence backed by sqflite on Android and iOS.
+version: 0.1.0
+homepage: https://github.com/your-org/local-remote-synchronization
+repository: https://github.com/your-org/local-remote-synchronization
+issue_tracker: https://github.com/your-org/local-remote-synchronization/issues
+
+environment:
+  sdk: ">=3.3.0 <4.0.0"
+  flutter: ">=3.19.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  local_remote_synchronization:
+    path: ../local_remote_synchronization
+  sqflite: ^2.4.2
+  path: ^1.9.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^5.0.0
+  mocktail: ^1.0.4
