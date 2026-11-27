@@ -3,35 +3,39 @@ import 'package:test/test.dart';
 
 void main() {
   group('LocalMutation', () {
-    test('constructs valid create/update/delete mutations and normalizes UTC',
-        () {
-      final localTime = DateTime(2026, 5, 1, 12, 30);
-      final createMutation = LocalMutation(
-        entityType: 'orders',
-        entityId: 'ord-1',
-        type: SyncOperationType.create,
-        payload: <String, dynamic>{'total': 42.5},
-        idempotencyKey: 'idem-1',
-        occurredAt: localTime,
-        metadata: const <String, dynamic>{'baseVersion': 1},
-      );
+    test(
+      'constructs valid create/update/delete mutations and normalizes UTC',
+      () {
+        final localTime = DateTime(2026, 5, 1, 12, 30);
+        final createMutation = LocalMutation(
+          entityType: 'orders',
+          entityId: 'ord-1',
+          type: SyncOperationType.create,
+          payload: <String, dynamic>{'total': 42.5},
+          idempotencyKey: 'idem-1',
+          occurredAt: localTime,
+          metadata: const <String, dynamic>{'baseVersion': 1},
+        );
 
-      expect(createMutation.entityType, 'orders');
-      expect(createMutation.entityId, 'ord-1');
-      expect(createMutation.type, SyncOperationType.create);
-      expect(createMutation.payload, <String, dynamic>{'total': 42.5});
-      expect(createMutation.idempotencyKey, 'idem-1');
-      expect(createMutation.occurredAt, localTime.toUtc());
-      expect(createMutation.occurredAt!.isUtc, isTrue);
-      expect(createMutation.metadata, const <String, dynamic>{'baseVersion': 1});
+        expect(createMutation.entityType, 'orders');
+        expect(createMutation.entityId, 'ord-1');
+        expect(createMutation.type, SyncOperationType.create);
+        expect(createMutation.payload, <String, dynamic>{'total': 42.5});
+        expect(createMutation.idempotencyKey, 'idem-1');
+        expect(createMutation.occurredAt, localTime.toUtc());
+        expect(createMutation.occurredAt!.isUtc, isTrue);
+        expect(createMutation.metadata, const <String, dynamic>{
+          'baseVersion': 1,
+        });
 
-      final deleteMutation = LocalMutation(
-        entityType: 'orders',
-        entityId: 'ord-1',
-        type: SyncOperationType.delete,
-      );
-      expect(deleteMutation.payload, isNull);
-    });
+        final deleteMutation = LocalMutation(
+          entityType: 'orders',
+          entityId: 'ord-1',
+          type: SyncOperationType.delete,
+        );
+        expect(deleteMutation.payload, isNull);
+      },
+    );
 
     test('validates required and non-empty fields', () {
       expect(
@@ -114,10 +118,7 @@ void main() {
       expect(mutation.metadata['tags'], <String>['urgent']);
 
       // Direct mutation attempts on stored collections must throw.
-      expect(
-        () => mutation.payload!['x'] = 1,
-        throwsUnsupportedError,
-      );
+      expect(() => mutation.payload!['x'] = 1, throwsUnsupportedError);
       expect(
         () => (mutation.payload!['address'] as Map<String, dynamic>)['city'] =
             'Giza',
@@ -128,8 +129,10 @@ void main() {
         throwsUnsupportedError,
       );
       expect(
-        () => ((mutation.payload!['items'] as List<Object?>)[1]
-            as Map<String, dynamic>)['sku'] = 'B',
+        () =>
+            ((mutation.payload!['items'] as List<Object?>)[1]
+                    as Map<String, dynamic>)['sku'] =
+                'B',
         throwsUnsupportedError,
       );
       expect(
@@ -215,5 +218,57 @@ void main() {
       expect(a.hashCode, equals(b.hashCode));
       expect(a, isNot(equals(c)));
     });
+
+    test(
+      'rejects non-finite doubles in payload, metadata, and nested values',
+      () {
+        for (final invalid in <double>[
+          double.nan,
+          double.infinity,
+          double.negativeInfinity,
+        ]) {
+          expect(
+            () => LocalMutation(
+              entityType: 'orders',
+              entityId: 'ord-1',
+              type: SyncOperationType.create,
+              payload: <String, dynamic>{'total': invalid},
+            ),
+            throwsArgumentError,
+          );
+          expect(
+            () => LocalMutation(
+              entityType: 'orders',
+              entityId: 'ord-1',
+              type: SyncOperationType.create,
+              payload: <String, dynamic>{
+                'nested': <String, dynamic>{
+                  'list': <Object?>[1, invalid],
+                },
+              },
+            ),
+            throwsArgumentError,
+          );
+          expect(
+            () => LocalMutation(
+              entityType: 'orders',
+              entityId: 'ord-1',
+              type: SyncOperationType.delete,
+              metadata: <String, dynamic>{'score': invalid},
+            ),
+            throwsArgumentError,
+          );
+        }
+
+        final valid = LocalMutation(
+          entityType: 'orders',
+          entityId: 'ord-1',
+          type: SyncOperationType.create,
+          payload: <String, dynamic>{'intVal': 10, 'doubleVal': -42.5},
+        );
+        expect(valid.payload!['intVal'], 10);
+        expect(valid.payload!['doubleVal'], -42.5);
+      },
+    );
   });
 }

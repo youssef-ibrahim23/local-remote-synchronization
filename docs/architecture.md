@@ -149,6 +149,11 @@ as a separate optional layer — not built into this Core.
 
 A local mutation and its corresponding `SyncOperation` **must** be persisted
 atomically. If the app crashes between writing the mutation and enqueuing the
-operation, data will be lost. Each `LocalStorageAdapter` implementation must
-guarantee this, typically by using a database transaction that writes both
-the domain record and the queue entry.
+operation, data will be lost.
+
+Because the Core `LocalStorageAdapter.runInTransaction` contract is
+database-agnostic and does not expose native transaction handles, adapters whose
+databases require explicit transaction objects (such as Sqflite) **must**
+provide an adapter-specific typed transaction API alongside `runInTransaction`
+so that both the application's domain writes and the `OutboxWriter` share the
+exact same underlying native database transaction.

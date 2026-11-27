@@ -31,10 +31,10 @@ final class SyncSuccess extends SyncResult {
     this.remoteVersion,
     DateTime? serverTimestamp,
     Map<String, dynamic>? syncedData,
-  })  : serverTimestamp = serverTimestamp?.toUtc(),
-        syncedData = syncedData == null
-            ? null
-            : deepFreezeMap(syncedData, fieldName: 'syncedData');
+  }) : serverTimestamp = serverTimestamp?.toUtc(),
+       syncedData = syncedData == null
+           ? null
+           : deepFreezeMap(syncedData, fieldName: 'syncedData');
 
   static const DeepCollectionEquality _equality = DeepCollectionEquality();
 
@@ -59,11 +59,11 @@ final class SyncSuccess extends SyncResult {
 
   @override
   int get hashCode => Object.hash(
-        operationId,
-        remoteVersion,
-        serverTimestamp,
-        _equality.hash(syncedData),
-      );
+    operationId,
+    remoteVersion,
+    serverTimestamp,
+    _equality.hash(syncedData),
+  );
 }
 
 /// Indicates the remote backend rejected the operation due to a state or
@@ -76,11 +76,11 @@ final class SyncConflict extends SyncResult {
     required Map<String, dynamic> remoteSnapshot,
     this.remoteVersion,
     DateTime? serverTimestamp,
-  })  : remoteSnapshot = deepFreezeMap(
-          remoteSnapshot,
-          fieldName: 'remoteSnapshot',
-        ),
-        serverTimestamp = serverTimestamp?.toUtc();
+  }) : remoteSnapshot = deepFreezeMap(
+         remoteSnapshot,
+         fieldName: 'remoteSnapshot',
+       ),
+       serverTimestamp = serverTimestamp?.toUtc();
 
   static const DeepCollectionEquality _equality = DeepCollectionEquality();
 
@@ -105,21 +105,18 @@ final class SyncConflict extends SyncResult {
 
   @override
   int get hashCode => Object.hash(
-        operationId,
-        _equality.hash(remoteSnapshot),
-        remoteVersion,
-        serverTimestamp,
-      );
+    operationId,
+    _equality.hash(remoteSnapshot),
+    remoteVersion,
+    serverTimestamp,
+  );
 }
 
 /// Indicates the remote push failed with a structured [SyncError].
 @immutable
 final class SyncFailure extends SyncResult {
   /// Creates a [SyncFailure] result.
-  SyncFailure({
-    required super.operationId,
-    required this.error,
-  });
+  SyncFailure({required super.operationId, required this.error});
 
   /// Structured error describing why the push failed.
   final SyncError error;

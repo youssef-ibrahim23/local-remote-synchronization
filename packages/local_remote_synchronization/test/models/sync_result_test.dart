@@ -4,15 +4,14 @@ import 'package:test/test.dart';
 void main() {
   group('SyncResult', () {
     test('validates non-empty operationId', () {
-      expect(
-        () => SyncSuccess(operationId: '  '),
-        throwsArgumentError,
-      );
+      expect(() => SyncSuccess(operationId: '  '), throwsArgumentError);
     });
 
     test('SyncSuccess enforces deep immutability and equality', () {
       final raw = <String, dynamic>{
-        'server': <String, dynamic>{'tags': <String>['a']},
+        'server': <String, dynamic>{
+          'tags': <String>['a'],
+        },
       };
       final ts = DateTime(2026, 6, 1, 14);
       final a = SyncSuccess(
@@ -26,7 +25,9 @@ void main() {
         remoteVersion: 'v2',
         serverTimestamp: ts,
         syncedData: <String, dynamic>{
-          'server': <String, dynamic>{'tags': <String>['a']},
+          'server': <String, dynamic>{
+            'tags': <String>['a'],
+          },
         },
       );
 

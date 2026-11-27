@@ -19,7 +19,19 @@ Map<String, dynamic> deepFreezeMap(
 /// Supported types: `Map<String, dynamic>` (or `Map` with `String` keys),
 /// `List`, `String`, `num`, `bool`, and `null`.
 Object? deepFreezeJsonValue(Object? value, {String path = 'value'}) {
-  if (value == null || value is String || value is num || value is bool) {
+  if (value == null || value is String || value is int || value is bool) {
+    return value;
+  }
+
+  if (value is double) {
+    if (!value.isFinite) {
+      throw ArgumentError.value(
+        value,
+        path,
+        'Non-finite double values (NaN, Infinity, -Infinity) are not valid '
+        'JSON numbers.',
+      );
+    }
     return value;
   }
 

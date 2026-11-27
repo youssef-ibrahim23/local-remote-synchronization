@@ -54,14 +54,10 @@ final class SyncError {
       );
     }
     if (rawRetryAfterMs != null && rawRetryAfterMs is! int) {
-      throw FormatException(
-        'Invalid SyncError.retryAfterMs: $rawRetryAfterMs',
-      );
+      throw FormatException('Invalid SyncError.retryAfterMs: $rawRetryAfterMs');
     }
     if (rawStatusCode != null && rawStatusCode is! int) {
-      throw FormatException(
-        'Invalid SyncError.statusCode: $rawStatusCode',
-      );
+      throw FormatException('Invalid SyncError.statusCode: $rawStatusCode');
     }
 
     final SyncErrorCode code;
@@ -105,12 +101,12 @@ final class SyncError {
 
   /// Serializes persistable error fields to a JSON map.
   Map<String, dynamic> toJson() => <String, dynamic>{
-        'code': code.name,
-        'message': message,
-        'isRetryable': isRetryable,
-        if (retryAfter != null) 'retryAfterMs': retryAfter!.inMilliseconds,
-        if (statusCode != null) 'statusCode': statusCode,
-      };
+    'code': code.name,
+    'message': message,
+    'isRetryable': isRetryable,
+    if (retryAfter != null) 'retryAfterMs': retryAfter!.inMilliseconds,
+    if (statusCode != null) 'statusCode': statusCode,
+  };
 
   @override
   bool operator ==(Object other) =>

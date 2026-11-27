@@ -21,24 +21,16 @@ final class LocalMutation {
     this.idempotencyKey,
     DateTime? occurredAt,
     Map<String, dynamic> metadata = const <String, dynamic>{},
-  })  : payload = payload == null
-            ? null
-            : deepFreezeMap(payload, fieldName: 'payload'),
-        occurredAt = occurredAt?.toUtc(),
-        metadata = deepFreezeMap(metadata, fieldName: 'metadata') {
+  }) : payload = payload == null
+           ? null
+           : deepFreezeMap(payload, fieldName: 'payload'),
+       occurredAt = occurredAt?.toUtc(),
+       metadata = deepFreezeMap(metadata, fieldName: 'metadata') {
     if (entityType.trim().isEmpty) {
-      throw ArgumentError.value(
-        entityType,
-        'entityType',
-        'Must not be empty.',
-      );
+      throw ArgumentError.value(entityType, 'entityType', 'Must not be empty.');
     }
     if (entityId.trim().isEmpty) {
-      throw ArgumentError.value(
-        entityId,
-        'entityId',
-        'Must not be empty.',
-      );
+      throw ArgumentError.value(entityId, 'entityId', 'Must not be empty.');
     }
     if (type != SyncOperationType.delete && this.payload == null) {
       throw ArgumentError.value(
@@ -96,12 +88,12 @@ final class LocalMutation {
 
   @override
   int get hashCode => Object.hash(
-        entityType,
-        entityId,
-        type,
-        _equality.hash(payload),
-        idempotencyKey,
-        occurredAt,
-        _equality.hash(metadata),
-      );
+    entityType,
+    entityId,
+    type,
+    _equality.hash(payload),
+    idempotencyKey,
+    occurredAt,
+    _equality.hash(metadata),
+  );
 }

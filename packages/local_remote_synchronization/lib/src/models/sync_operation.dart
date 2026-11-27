@@ -20,6 +20,7 @@ final class SyncOperation {
     required this.entityId,
     required this.type,
     required DateTime createdAt,
+    DateTime? occurredAt,
     Map<String, dynamic>? payload,
     Map<String, dynamic> metadata = const <String, dynamic>{},
     this.status = SyncOperationStatus.pending,
@@ -27,12 +28,13 @@ final class SyncOperation {
     this.sequenceNumber,
     DateTime? nextRetryAt,
     this.lastError,
-  })  : createdAt = createdAt.toUtc(),
-        payload = payload == null
-            ? null
-            : deepFreezeMap(payload, fieldName: 'payload'),
-        metadata = deepFreezeMap(metadata, fieldName: 'metadata'),
-        nextRetryAt = nextRetryAt?.toUtc() {
+  }) : createdAt = createdAt.toUtc(),
+       occurredAt = occurredAt?.toUtc(),
+       payload = payload == null
+           ? null
+           : deepFreezeMap(payload, fieldName: 'payload'),
+       metadata = deepFreezeMap(metadata, fieldName: 'metadata'),
+       nextRetryAt = nextRetryAt?.toUtc() {
     if (operationId.trim().isEmpty) {
       throw ArgumentError.value(
         operationId,
@@ -48,25 +50,13 @@ final class SyncOperation {
       );
     }
     if (entityType.trim().isEmpty) {
-      throw ArgumentError.value(
-        entityType,
-        'entityType',
-        'Must not be empty.',
-      );
+      throw ArgumentError.value(entityType, 'entityType', 'Must not be empty.');
     }
     if (entityId.trim().isEmpty) {
-      throw ArgumentError.value(
-        entityId,
-        'entityId',
-        'Must not be empty.',
-      );
+      throw ArgumentError.value(entityId, 'entityId', 'Must not be empty.');
     }
     if (attemptCount < 0) {
-      throw ArgumentError.value(
-        attemptCount,
-        'attemptCount',
-        'Must be >= 0.',
-      );
+      throw ArgumentError.value(attemptCount, 'attemptCount', 'Must be >= 0.');
     }
     if (sequenceNumber != null && sequenceNumber! < 0) {
       throw ArgumentError.value(
@@ -87,6 +77,8 @@ final class SyncOperation {
   /// Creates a [SyncOperation] from a [LocalMutation] using an externally
   /// generated [operationId].
   ///
+  /// Uses [now] (or `DateTime.now()` when omitted) for [createdAt], while
+  /// preserving [LocalMutation.occurredAt] separately as [occurredAt].
   /// The resulting [idempotencyKey] is `mutation.idempotencyKey ?? operationId`
   /// and remains stable across all retries and restarts.
   factory SyncOperation.fromMutation(
@@ -95,7 +87,7 @@ final class SyncOperation {
     DateTime? now,
     int? sequenceNumber,
   }) {
-    final createdAt = (mutation.occurredAt ?? now ?? DateTime.now()).toUtc();
+    final createdAt = (now ?? DateTime.now()).toUtc();
     return SyncOperation(
       operationId: operationId,
       idempotencyKey: mutation.idempotencyKey ?? operationId,
@@ -103,6 +95,7 @@ final class SyncOperation {
       entityId: mutation.entityId,
       type: mutation.type,
       createdAt: createdAt,
+      occurredAt: mutation.occurredAt,
       payload: mutation.payload,
       metadata: mutation.metadata,
       sequenceNumber: sequenceNumber,
@@ -119,6 +112,7 @@ final class SyncOperation {
     final rawStatus = json['status'];
     final rawAttemptCount = json['attemptCount'];
     final rawCreatedAt = json['createdAt'];
+    final rawOccurredAt = json['occurredAt'];
     final rawPayload = json['payload'];
     final rawMetadata = json['metadata'];
     final rawSequenceNumber = json['sequenceNumber'];
@@ -146,9 +140,7 @@ final class SyncOperation {
       );
     }
     if (rawType is! String) {
-      throw FormatException(
-        'Invalid or missing SyncOperation.type: $rawType',
-      );
+      throw FormatException('Invalid or missing SyncOperation.type: $rawType');
     }
     if (rawStatus is! String) {
       throw FormatException(
@@ -164,6 +156,9 @@ final class SyncOperation {
       throw FormatException(
         'Invalid or missing SyncOperation.createdAt: $rawCreatedAt',
       );
+    }
+    if (rawOccurredAt != null && rawOccurredAt is! String) {
+      throw FormatException('Invalid SyncOperation.occurredAt: $rawOccurredAt');
     }
     if (rawPayload != null && rawPayload is! Map) {
       throw FormatException(
@@ -212,6 +207,9 @@ final class SyncOperation {
       entityId: rawEntityId,
       type: type,
       createdAt: DateTime.parse(rawCreatedAt).toUtc(),
+      occurredAt: rawOccurredAt == null
+          ? null
+          : DateTime.parse(rawOccurredAt).toUtc(),
       payload: rawPayload == null ? null : _castStringKeyMap(rawPayload),
       metadata: rawMetadata == null
           ? const <String, dynamic>{}
@@ -271,8 +269,11 @@ final class SyncOperation {
   /// Number of push attempts completed so far.
   final int attemptCount;
 
-  /// UTC timestamp when the operation was created.
+  /// UTC timestamp when the outbox operation was created/persisted.
   final DateTime createdAt;
+
+  /// Optional UTC timestamp when the original local mutation occurred.
+  final DateTime? occurredAt;
 
   /// Optional monotonic sequence number assigned by local storage for
   /// deterministic ordering within the same timestamp.
@@ -297,40 +298,42 @@ final class SyncOperation {
     bool clearNextRetryAt = false,
     SyncError? lastError,
     bool clearLastError = false,
-  }) =>
-      SyncOperation(
-        operationId: operationId,
-        idempotencyKey: idempotencyKey,
-        entityType: entityType,
-        entityId: entityId,
-        type: type,
-        createdAt: createdAt,
-        payload: payload,
-        metadata: metadata,
-        status: status ?? this.status,
-        attemptCount: attemptCount ?? this.attemptCount,
-        sequenceNumber:
-            clearSequenceNumber ? null : (sequenceNumber ?? this.sequenceNumber),
-        nextRetryAt: clearNextRetryAt ? null : (nextRetryAt ?? this.nextRetryAt),
-        lastError: clearLastError ? null : (lastError ?? this.lastError),
-      );
+  }) => SyncOperation(
+    operationId: operationId,
+    idempotencyKey: idempotencyKey,
+    entityType: entityType,
+    entityId: entityId,
+    type: type,
+    createdAt: createdAt,
+    occurredAt: occurredAt,
+    payload: payload,
+    metadata: metadata,
+    status: status ?? this.status,
+    attemptCount: attemptCount ?? this.attemptCount,
+    sequenceNumber: clearSequenceNumber
+        ? null
+        : (sequenceNumber ?? this.sequenceNumber),
+    nextRetryAt: clearNextRetryAt ? null : (nextRetryAt ?? this.nextRetryAt),
+    lastError: clearLastError ? null : (lastError ?? this.lastError),
+  );
 
   /// Serializes this [SyncOperation] to a JSON-compatible map.
   Map<String, dynamic> toJson() => <String, dynamic>{
-        'operationId': operationId,
-        'idempotencyKey': idempotencyKey,
-        'entityType': entityType,
-        'entityId': entityId,
-        'type': type.name,
-        'payload': payload,
-        'metadata': metadata,
-        'status': status.name,
-        'attemptCount': attemptCount,
-        'createdAt': createdAt.toIso8601String(),
-        if (sequenceNumber != null) 'sequenceNumber': sequenceNumber,
-        if (nextRetryAt != null) 'nextRetryAt': nextRetryAt!.toIso8601String(),
-        if (lastError != null) 'lastError': lastError!.toJson(),
-      };
+    'operationId': operationId,
+    'idempotencyKey': idempotencyKey,
+    'entityType': entityType,
+    'entityId': entityId,
+    'type': type.name,
+    'payload': payload,
+    'metadata': metadata,
+    'status': status.name,
+    'attemptCount': attemptCount,
+    'createdAt': createdAt.toIso8601String(),
+    if (occurredAt != null) 'occurredAt': occurredAt!.toIso8601String(),
+    if (sequenceNumber != null) 'sequenceNumber': sequenceNumber,
+    if (nextRetryAt != null) 'nextRetryAt': nextRetryAt!.toIso8601String(),
+    if (lastError != null) 'lastError': lastError!.toJson(),
+  };
 
   @override
   bool operator ==(Object other) =>
@@ -347,24 +350,26 @@ final class SyncOperation {
           status == other.status &&
           attemptCount == other.attemptCount &&
           createdAt == other.createdAt &&
+          occurredAt == other.occurredAt &&
           sequenceNumber == other.sequenceNumber &&
           nextRetryAt == other.nextRetryAt &&
           lastError == other.lastError;
 
   @override
   int get hashCode => Object.hash(
-        operationId,
-        idempotencyKey,
-        entityType,
-        entityId,
-        type,
-        _equality.hash(payload),
-        _equality.hash(metadata),
-        status,
-        attemptCount,
-        createdAt,
-        sequenceNumber,
-        nextRetryAt,
-        lastError,
-      );
+    operationId,
+    idempotencyKey,
+    entityType,
+    entityId,
+    type,
+    _equality.hash(payload),
+    _equality.hash(metadata),
+    status,
+    attemptCount,
+    createdAt,
+    occurredAt,
+    sequenceNumber,
+    nextRetryAt,
+    lastError,
+  );
 }
