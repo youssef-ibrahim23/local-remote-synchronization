@@ -2,26 +2,22 @@ name: local_remote_hive
 description: >-
   Hive implementation of LocalStorageAdapter for the
   local_remote_synchronization ecosystem. Provides lightweight, key-value
-  offline-first persistence using Hive on all Flutter platforms.
+  offline-first persistence using Hive on all Dart platforms.
 version: 0.1.0
+publish_to: none
 homepage: https://github.com/youssef-ibrahim23/local-remote-synchronization
 repository: https://github.com/youssef-ibrahim23/local-remote-synchronization
 issue_tracker: https://github.com/youssef-ibrahim23/local-remote-synchronization/issues
 
 environment:
-  sdk: ">=3.3.0 <4.0.0"
-  flutter: ">=3.19.0"
+  sdk: ">=3.5.0 <4.0.0"
 
 dependencies:
-  flutter:
-    sdk: flutter
+  hive: ^2.2.3
   local_remote_synchronization:
     path: ../local_remote_synchronization
-  hive_flutter: ^1.1.0
+  uuid: ^4.5.1
 
 dev_dependencies:
-  flutter_test:
-    sdk: flutter
-  flutter_lints: ^5.0.0
-  hive_test: ^1.0.1
-  mocktail: ^1.0.4
+  lints: ^5.0.0
+  test: ^1.25.0
