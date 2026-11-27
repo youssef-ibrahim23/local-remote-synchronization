@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 
 import 'package:hive/hive.dart';
 import 'package:local_remote_synchronization/local_remote_synchronization.dart';
@@ -18,20 +19,21 @@ import 'hive_outbox_writer.dart';
 ///
 /// All operations and the sequence counter are stored in one JSON snapshot.
 /// Each mutation loads the snapshot, applies changes in memory, and writes
-/// the complete snapshot back in a single [Box.put] call. This provides
-/// atomicity for outbox operations within a single Hive box write.
+/// the complete snapshot back using a single [Box.put] call. This reduces
+/// multi-key consistency problems by keeping all outbox state in one key.
 ///
-/// **Durability limitation:** A single Hive box write is not an unconditional
-/// crash-atomic or ACID guarantee. Hive may buffer writes in memory before
-/// flushing to disk. For stronger durability guarantees, consider calling
-/// `box.compact()` periodically or using a database with explicit transaction
-/// support (Drift, Sqflite).
+/// **Durability limitation:** Hive does NOT provide an ACID transaction or
+/// an unconditional crash-atomic durability guarantee. A successful
+/// [Box.put] must not be presented as an absolute guarantee against data
+/// loss after a process or system crash. Hive may buffer writes in memory
+/// before flushing to disk. For stronger durability guarantees, use a
+/// database with explicit transaction support (Drift, Sqflite).
 ///
 /// ## Concurrency
 ///
 /// All mutations are serialized through an internal async mutex. This
 /// prevents race conditions in sequence number allocation and ensures
-/// read-modify-write cycles are atomic within the adapter instance.
+/// read-modify-write cycles are consistent within the adapter instance.
 ///
 /// **Note:** The mutex is per-adapter-instance. If multiple adapter instances
 /// share the same Hive box, they can still race. Use a single adapter
@@ -71,7 +73,7 @@ final class HiveLocalStorageAdapter implements LocalStorageAdapter {
 
   /// Zone-unaware [OutboxWriter] for use outside of [runInTransaction].
   ///
-  /// Writes are applied immediately to the snapshot. For atomic outbox
+  /// Writes are applied immediately to the snapshot. For staged outbox
   /// operations, use [runInTransaction] or [runWithTransaction] instead.
   OutboxWriter get outbox => _DirectOutboxWriter(this);
 
@@ -84,15 +86,18 @@ final class HiveLocalStorageAdapter implements LocalStorageAdapter {
     // consistency and future extensibility.
   }
 
-  /// Executes [action] inside an atomic outbox transaction.
+  /// Executes [action] with staged outbox writes.
   ///
-  /// Outbox writes through the provided [OutboxWriter] are buffered and
-  /// flushed atomically on success. If [action] throws, all buffered writes
-  /// are discarded.
+  /// Outbox writes through the provided [OutboxWriter] are buffered in
+  /// memory. On success, the resulting snapshot is persisted using one
+  /// [Box.put] call. If [action] throws, all buffered writes are discarded
+  /// and no changes are persisted.
   ///
-  /// Note: Hive does not provide multi-key transactions. This method only
-  /// guarantees atomicity for outbox operations within a single snapshot
-  /// write, not for domain writes on other Hive boxes.
+  /// Note: Hive does not provide multi-key transactions or an ACID
+  /// guarantee. This method stages all outbox changes in memory and
+  /// persists the resulting snapshot in a single write, which reduces
+  /// multi-key consistency problems. It does not cover domain writes on
+  /// other Hive boxes.
   @override
   Future<T> runInTransaction<T>(
     Future<T> Function(OutboxWriter outbox) action,
@@ -186,7 +191,7 @@ final class HiveLocalStorageAdapter implements LocalStorageAdapter {
     if (preservePerEntityOrder) {
       final entityEarliestSeq = <String, int>{};
       for (final op in allOperations) {
-        final entityKey = '${op.entityType}:${op.entityId}';
+        final entityKey = _entityKey(op.entityType, op.entityId);
         final seq = op.sequenceNumber ?? 0;
         final existing = entityEarliestSeq[entityKey];
         if (existing == null || seq < existing) {
@@ -195,7 +200,7 @@ final class HiveLocalStorageAdapter implements LocalStorageAdapter {
       }
 
       eligible = eligible.where((op) {
-        final entityKey = '${op.entityType}:${op.entityId}';
+        final entityKey = _entityKey(op.entityType, op.entityId);
         final earliestSeq = entityEarliestSeq[entityKey];
         final opSeq = op.sequenceNumber ?? 0;
         return opSeq == earliestSeq;
@@ -406,6 +411,13 @@ final class HiveLocalStorageAdapter implements LocalStorageAdapter {
       // Ignore emissions if the caller already closed the box.
     }
   }
+
+  /// Returns a collision-safe key for the `(entityType, entityId)` pair.
+  ///
+  /// JSON-encoding a two-element list ensures that entity types or IDs
+  /// containing delimiter characters (like `:`) cannot cause key collisions.
+  static String _entityKey(String entityType, String entityId) =>
+      jsonEncode(<String>[entityType, entityId]);
 }
 
 /// Direct [OutboxWriter] for use outside of

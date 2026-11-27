@@ -476,6 +476,54 @@ void main() {
         <String>[op2.operationId, op3.operationId],
       );
     });
+
+    test('FIFO keys are collision-safe for entity types with delimiters',
+        () async {
+      final t0 = DateTime.utc(2026, 6, 1, 10);
+      var counter = 0;
+      final adapter = HiveLocalStorageAdapter(
+        box: box,
+        operationIdGenerator: () => 'op-collision-${++counter}',
+        clock: () => t0.add(Duration(seconds: counter)),
+      );
+      addTearDown(adapter.dispose);
+
+      // These two entities would collide with '${entityType}:${entityId}':
+      //   'tasks' + 'a:b'  -> 'tasks:a:b'
+      //   'tasks:a' + 'b'  -> 'tasks:a:b'
+      // JSON encoding produces distinct keys.
+      final op1 = await adapter.runInTransaction(
+        (outbox) => outbox.enqueue(
+          LocalMutation(
+            entityType: 'tasks',
+            entityId: 'a:b',
+            type: SyncOperationType.create,
+            payload: const <String, dynamic>{'v': 1},
+          ),
+        ),
+      );
+      final op2 = await adapter.runInTransaction(
+        (outbox) => outbox.enqueue(
+          LocalMutation(
+            entityType: 'tasks:a',
+            entityId: 'b',
+            type: SyncOperationType.create,
+            payload: const <String, dynamic>{'v': 2},
+          ),
+        ),
+      );
+
+      // Both entities should have their earliest operation eligible.
+      final eligible = await adapter.fetchEligibleOperations(
+        now: t0.add(const Duration(minutes: 1)),
+        limit: 10,
+      );
+      expect(eligible, hasLength(2));
+      expect(
+        eligible.map((o) => o.operationId),
+        containsAll(<String>[op1.operationId, op2.operationId]),
+      );
+    });
   });
 
   group('State transitions & Crash recovery', () {

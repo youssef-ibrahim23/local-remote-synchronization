@@ -6,12 +6,11 @@ import 'hive_outbox_snapshot.dart';
 ///
 /// This writer is used inside `HiveLocalStorageAdapter.runInTransaction`.
 /// It operates on a mutable copy of the [HiveOutboxSnapshot] and buffers
-/// operations in memory. The adapter persists the complete snapshot in a
-/// single box write after the transaction action completes successfully.
+/// operations in memory. The adapter persists the complete snapshot using
+/// one `Box.put` call after the transaction action completes successfully.
 ///
 /// Sequence numbers are allocated from `snapshot.lastSequenceNumber`, which
-/// is incremented atomically within the adapter's serialized mutation
-/// boundary.
+/// is incremented within the adapter's serialized mutation boundary.
 final class HiveOutboxWriter implements OutboxWriter {
   /// Creates a [HiveOutboxWriter] bound to [snapshot].
   ///

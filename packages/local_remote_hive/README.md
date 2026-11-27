@@ -64,7 +64,7 @@ The adapter does not open or close boxes — the application owns their
 lifecycle. Call `ensureInitialized()` for API consistency; it is a no-op
 because Hive boxes are already open.
 
-### 3. Write domain data and enqueue a mutation atomically
+### 3. Write domain data and enqueue a mutation with staged outbox writes
 
 ```dart
 await adapter.runWithTransaction((outbox) async {
@@ -85,9 +85,9 @@ await adapter.runWithTransaction((outbox) async {
 });
 ```
 
-Outbox writes through the provided `OutboxWriter` are buffered and flushed
-atomically on success. If the action throws, all buffered writes are
-discarded.
+Outbox writes through the provided `OutboxWriter` are buffered in memory.
+On success, the resulting snapshot is persisted using one `Box.put` call.
+If the action throws, all buffered writes are discarded.
 
 ### 4. External-write approach
 
@@ -137,14 +137,15 @@ All outbox state is stored in **one JSON snapshot** under the key
 - `operations` — array of all active `SyncOperation` records
 
 Each mutation loads the snapshot, applies changes in memory, and writes the
-complete snapshot back in a **single `Box.put` call**. This ensures that
-either all changes are persisted or none are.
+complete snapshot back using a **single `Box.put` call**. This reduces
+multi-key consistency problems by keeping all outbox state in one key.
 
-**Durability limitation:** A single Hive box write is not an unconditional
-crash-atomic or ACID guarantee. Hive may buffer writes in memory before
-flushing to disk. For stronger durability guarantees, consider calling
-`box.compact()` periodically or using a database with explicit transaction
-support (Drift, Sqflite).
+**Durability limitation:** Hive does NOT provide an ACID transaction or an
+unconditional crash-atomic durability guarantee. A successful `Box.put`
+must not be presented as an absolute guarantee against data loss after a
+process or system crash. Hive may buffer writes in memory before flushing
+to disk. For stronger durability guarantees, use a database with explicit
+transaction support (Drift, Sqflite).
 
 ### Transaction semantics
 
@@ -158,9 +159,10 @@ support (Drift, Sqflite).
    the complete snapshot in one write.
 6. On failure: discard the working copy — no changes are persisted.
 
-Hive does not provide multi-key transactions, so this method only
-guarantees atomicity for **outbox operations** within the snapshot. Domain
-writes on other Hive boxes are **not** covered by this transaction.
+Hive does not provide multi-key transactions or an ACID guarantee. This
+method stages all outbox changes in memory and persists the resulting
+snapshot in a single write, which reduces multi-key consistency problems.
+It does not cover domain writes on other Hive boxes.
 
 For atomic domain + outbox writes, consider:
 - Using a single Hive box for related data.
@@ -171,7 +173,7 @@ For atomic domain + outbox writes, consider:
 
 All mutations are serialized through an internal async mutex. This prevents
 race conditions in sequence number allocation and ensures read-modify-write
-cycles are atomic within the adapter instance.
+cycles are consistent within the adapter instance.
 
 The following operations are serialized:
 - `runInTransaction` / `runWithTransaction`
