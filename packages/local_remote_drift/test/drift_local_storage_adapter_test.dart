@@ -843,16 +843,18 @@ void main() {
     });
 
     test(
-        'watchPendingCount emits after outer transaction commits with nested '
-        'runWithTransaction', () async {
-      // This test verifies that watchPendingCount works correctly when
-      // runWithTransaction is nested inside an outer db.transaction.
-      // The count is emitted after the outer transaction commits.
+        'watchPendingCount emits after child commit while outer '
+        'transaction is still open', () async {
+      // This test documents the known limitation: when runWithTransaction is
+      // nested inside an outer db.transaction, Drift creates a child SAVEPOINT.
+      // The child commits when runWithTransaction returns, which triggers
+      // _emitPendingCount, but the outer transaction is still open. This means
+      // watchPendingCount can emit a count before the data is durably persisted.
       final db = _TestAppDatabase(NativeDatabase.memory());
       var counter = 0;
       final adapter = DriftLocalStorageAdapter(
         database: db,
-        operationIdGenerator: () => 'op-nested-count-${++counter}',
+        operationIdGenerator: () => 'op-child-commit-${++counter}',
       );
       addTearDown(() async {
         await adapter.dispose();
@@ -865,23 +867,51 @@ void main() {
       // Initial emission: 0.
       expect(await queue.next, equals(0));
 
-      // Run nested transaction that commits successfully.
-      await db.transaction(() async {
+      // Coordinators to control the outer transaction timing.
+      final childCommitted = Completer<void>();
+      final allowOuterCommit = Completer<void>();
+      var outerCommitted = false;
+
+      // Start the outer transaction.
+      final outerTransaction = db.transaction(() async {
         await adapter.runWithTransaction((outbox) async {
           await outbox.enqueue(
             LocalMutation(
               entityType: 'tasks',
-              entityId: 't-nested-count',
+              entityId: 't-child-commit',
               type: SyncOperationType.delete,
-              payload: const <String, dynamic>{'id': 't-nested-count'},
+              payload: const <String, dynamic>{'id': 't-child-commit'},
             ),
           );
         });
-      });
+        // Child transaction has committed. Signal and wait before outer commits.
+        childCommitted.complete();
+        await allowOuterCommit.future;
+      }).then((_) => outerCommitted = true);
 
-      // After outer transaction commits, the count should be 1.
-      expect(await queue.next, equals(1),
-          reason: 'count must be 1 after outer transaction commits');
+      // Wait for child transaction to commit.
+      await childCommitted.future;
+
+      // The child has committed and _emitPendingCount was called.
+      // Wait for the emission to reach our listener while outer is still open.
+      // The timeout is a safety net; the emission should arrive deterministically.
+      final emittedValue = await queue.next.timeout(
+        const Duration(seconds: 5),
+        onTimeout: () => fail('Expected pending count emission did not arrive'),
+      );
+
+      // Verify the emission is the premature count of 1.
+      expect(emittedValue, equals(1),
+          reason: 'premature emission must be 1 after child commit');
+
+      // Verify the outer transaction has NOT committed yet.
+      expect(outerCommitted, isFalse,
+          reason: 'emission must occur while outer transaction is still open');
+
+      // Allow the outer transaction to commit.
+      allowOuterCommit.complete();
+      await outerTransaction;
+      expect(outerCommitted, isTrue);
     });
 
     test(
@@ -898,32 +928,52 @@ void main() {
         await db.close();
       });
 
-      // Use a simple list to collect events.
-      final events = <int>[];
-      final subscription = adapter.watchPendingCount().listen(events.add);
-      addTearDown(subscription.cancel);
+      final queue = StreamQueue<int>(adapter.watchPendingCount());
+      addTearDown(queue.cancel);
 
-      // Wait for initial emission.
-      await Future<void>.delayed(const Duration(milliseconds: 10));
-      expect(events, contains(0));
+      // Initial emission: 0.
+      expect(await queue.next, equals(0));
 
-      // The outer transaction aborts; child writes are rolled back.
-      await expectLater(
-        () => db.transaction(() async {
-          await adapter.runWithTransaction((outbox) async {
-            await outbox.enqueue(
-              LocalMutation(
-                entityType: 'tasks',
-                entityId: 't-correct',
-                type: SyncOperationType.delete,
-                payload: const <String, dynamic>{'id': 't-correct'},
-              ),
-            );
-          });
-          throw StateError('outer abort');
-        }),
-        throwsStateError,
+      // Coordinators to control the outer transaction timing.
+      final childCommitted = Completer<void>();
+      final allowOuterAbort = Completer<void>();
+
+      // Start the outer transaction that will abort.
+      final outerTransaction = db.transaction(() async {
+        await adapter.runWithTransaction((outbox) async {
+          await outbox.enqueue(
+            LocalMutation(
+              entityType: 'tasks',
+              entityId: 't-correct',
+              type: SyncOperationType.delete,
+              payload: const <String, dynamic>{'id': 't-correct'},
+            ),
+          );
+        });
+        // Child transaction has committed. Signal and wait before outer aborts.
+        childCommitted.complete();
+        await allowOuterAbort.future;
+        throw StateError('outer abort');
+      });
+
+      // Wait for child transaction to commit.
+      await childCommitted.future;
+
+      // Verify that the stream can emit 1 while the outer transaction is still
+      // open. This proves the documented premature emission limitation.
+      // The timeout is a safety net; the emission should arrive deterministically.
+      final emittedValue = await queue.next.timeout(
+        const Duration(seconds: 5),
+        onTimeout: () => fail('Expected pending count emission did not arrive'),
       );
+
+      // Verify the emission is the premature count of 1.
+      expect(emittedValue, equals(1),
+          reason: 'premature emission must be 1 after child commit');
+
+      // Allow the outer transaction to abort.
+      allowOuterAbort.complete();
+      await expectLater(outerTransaction, throwsStateError);
 
       // Verify that the database is empty (rollback occurred).
       final ops = await adapter.fetchEligibleOperations(
@@ -935,19 +985,19 @@ void main() {
               'outbox write must be rolled back with the outer transaction');
 
       // Verify directly that the table is empty.
-      final directCount = await db.customSelect(
-        'SELECT COUNT(*) AS count FROM sync_outbox',
-      ).getSingle();
+      final directCount = await db
+          .customSelect(
+            'SELECT COUNT(*) AS count FROM sync_outbox',
+          )
+          .getSingle();
       expect(directCount.read<int>('count'), equals(0),
           reason: 'direct count must be 0 after rollback');
 
-      // Clear events and manually refresh.
-      events.clear();
+      // Manually refresh so the stream reflects the rolled-back state.
       await adapter.refreshPendingCount();
 
-      // Wait for refresh emission.
-      await Future<void>.delayed(const Duration(milliseconds: 10));
-      expect(events, contains(0),
+      // The next emission must be 0 (corrected count).
+      expect(await queue.next, equals(0),
           reason: 'count must return to 0 after refresh following outer abort');
     });
   });
