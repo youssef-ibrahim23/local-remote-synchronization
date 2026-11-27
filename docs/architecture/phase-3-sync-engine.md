@@ -607,8 +607,9 @@ final class SyncCycleReport {
   /// Number of operations successfully pushed and confirmed removed
   /// from the outbox. Incremented **only** when `markSucceeded` completes
   /// without throwing. If `markSucceeded` throws, the persisted state is
-  /// unknown, [storageErrors] is incremented, and this counter is not.
-  final int succeeded;
+  /// unknown and this counter is not incremented. In Phase 3.1 the error
+  /// aborts the cycle and sets [cycleError]; from Phase 3.2 it increments
+  /// [storageErrors] and the cycle continues.
 
   /// Number of operations that failed and were scheduled for retry.
   /// Incremented **only** when `markFailed` completes without throwing.
@@ -758,14 +759,20 @@ that `SyncCycleReport` can remain immutable:
 ```dart
 /// Private mutable accumulator — never exposed publicly.
 final class _CycleAccumulator {
-  _CycleAccumulator({required this.startedAt, required this.eligibilityCutoff});
+  /// Phase 3.1 constructor:
+  /// _CycleAccumulator({required this.startedAt});
+  ///
+  /// Phase 3.2 adds the required [eligibilityCutoff] parameter.
+  _CycleAccumulator({
+    required this.startedAt,
+    required this.eligibilityCutoff,
+  });
 
   final DateTime startedAt;
 
-  /// Fixed cycle-wide eligibility cutoff — **Phase 3.2**. In Phase 3.1,
-  /// each `fetchEligibleOperations` call simply passes the current time;
-  /// the captured cutoff and its reuse across fetches arrive with retry
-  /// scheduling in Phase 3.2.
+  /// Added in Phase 3.2. Captured once from the cycle-start timestamp and
+  /// reused for every fetch in that cycle. This field does not exist in
+  /// the Phase 3.1 accumulator.
   final DateTime eligibilityCutoff;
 
   int fetched = 0;
@@ -995,13 +1002,13 @@ exception — funnels through a single `finally` that clears
 
 ```
 _executeCycle(slot):
+  ├─ cycleStartedAt = clock.now()
   ├─ accumulator = _CycleAccumulator(
-  │     startedAt: clock.now(),
-  │     // [3.2] captured once; reused for every fetch this cycle.
-  │     // [3.1] fetches pass clock.now() per call instead.
-  │     eligibilityCutoff: clock.now(),
+  │     startedAt: cycleStartedAt,
+  │     // [3.2] add eligibilityCutoff: cycleStartedAt.
+  │     // [3.1] this field/argument does not exist.
   │   )
-  ├─ attemptedOperationIds = <String>{}   ← same-cycle retry guard: [3.2]
+  ├─ attemptedOperationIds = <String>{}   ← added in Phase 3.2 only
   ├─ entityBlocked = <String>{}           ← entity outcomes: [3.4]
   │
   ├─ try {                              ← OUTER try: guarantees cleanup
@@ -1010,11 +1017,12 @@ _executeCycle(slot):
   │         accumulator.skippedOffline = true
   │       } else {
   │       loop:
-  │         a. operations = await localStorage.fetchEligibleOperations(
-  │              // [3.2] now: accumulator.eligibilityCutoff (fixed
-  │              //      cycle-wide cutoff). [3.1] now: clock.now()
-  │              //      (current time per fetch; no fixed cutoff).
-  │              now: accumulator.eligibilityCutoff,
+  │         a. // Phase 3.1: sample the clock for EACH fetch invocation.
+  │            final fetchNow = clock.now()
+  │            // Phase 3.2: replace fetchNow with the immutable
+  │            // accumulator.eligibilityCutoff captured at cycle start.
+  │            operations = await localStorage.fetchEligibleOperations(
+  │              now: fetchNow,
   │              limit: config.batchSize,
   │              preservePerEntityOrder: true,
   │            )
@@ -1262,19 +1270,33 @@ _pushAndHandle(op, acc, entityBlocked):
   │   }
   │
   ├─ switch (result) {
-  │     // [3.1] success path; [3.2] storageErrors reporting on
-  │     // transition failure; [3.4] entity blocking
+  │     // [3.1] success transition; [3.2] operation-level storage
+  │     // failure reporting; [3.4] entity blocking
   │     case SyncSuccess:
   │       try {
   │         await localStorage.markSucceeded(op.operationId)
   │         acc.succeeded++          ← only after successful transition
-  │         // Entity NOT blocked — next op for this entity may be
-  │         // considered in a later fetch within this cycle
-  │       } catch (e) {
-  │         // Storage transition failed — persisted state UNKNOWN
-  │         acc.storageErrors++
-  │         entityBlocked.add(entityKey)
-  │         log warning
+  │         // [3.4] Entity remains unblocked after successful transition.
+  │       } catch (e, st) {
+  │         // Persisted state is UNKNOWN: it may be inFlight, pending,
+  │         // or already removed. Never assume it remains inFlight.
+  │         //
+  │         // [3.1 INTERIM] Set a cycle-level storage error and rethrow.
+  │         // Future.wait settles the rest of this chunk before the
+  │         // cycle boundary aborts the cycle. Do not increment
+  │         // succeeded or storageErrors.
+  │         acc.cycleError ??= SyncError(
+  │           code: SyncErrorCode.storage,
+  │           message: 'markSucceeded failed (state unknown): $e',
+  │           isRetryable: true,
+  │           cause: e,
+  │           stackTrace: st,
+  │         )
+  │         rethrow
+  │         // [3.2 FINAL] Replace the interim cycle abort with:
+  │         // acc.storageErrors++
+  │         // log warning; do not rethrow; do not increment succeeded.
+  │         // [3.4] Also add entityBlocked.add(entityKey).
   │       }
   │
   │     // [3.2] retry scheduling / dead-letter decisions / policy
@@ -1369,9 +1391,11 @@ _pushAndHandle(op, acc, entityBlocked):
   and only when `identical(_activeCycleSlot, slot)`.
 - **Immutable reports:** One `_CycleAccumulator` per cycle; exactly one
   `SyncCycleReport` built at completion with `completedAt` populated.
-- **Storage failures are reported** `[3.2]`: Every post-push storage
-  transition failure increments `storageErrors`, making `isSuccess`
-  false. The persisted state is documented as unknown.
+- **Post-push storage failures are staged:** In Phase 3.1,
+  `markSucceeded` failure sets `cycleError` and aborts after the
+  current chunk settles (no `storageErrors` increment). From Phase 3.2,
+  post-push transition failures increment `storageErrors` and the cycle
+  continues. Persisted state is unknown in both cases.
 - **Fixed eligibility cutoff** `[3.2]`: `eligibilityCutoff` is captured
   at cycle start and used for all `fetchEligibleOperations` calls. This
   ensures an operation whose `nextRetryAt` becomes eligible during the
@@ -1979,7 +2003,7 @@ that abort the cycle.
 | Scenario | Engine Behavior | Persisted State After | Report Counter |
 |----------|----------------|----------------------|----------------|
 | `SyncSuccess` + `markSucceeded` succeeds | Operation removed from outbox | Removed | `succeeded++` |
-| `SyncSuccess` + `markSucceeded` throws | Log warning, block entity for cycle | **Unknown** (may or may not be removed) | `storageErrors++` |
+| `SyncSuccess` + `markSucceeded` throws | **Phase 3.1:** set `cycleError`, abort after current chunk settles; no outcome counter. **Phase 3.2+:** log and continue; **Phase 3.4:** block entity for cycle | **Unknown** (may be inFlight, pending, or removed) | **Phase 3.1:** `cycleError`; **Phase 3.2+:** `storageErrors++` |
 | `SyncFailure` (retryable) + `markFailed` succeeds | Operation scheduled for retry | `failed` with `nextRetryAt` | `failed++` |
 | `SyncFailure` (retryable) + `markFailed` throws | Log warning, block entity for cycle | **Unknown** | `storageErrors++` |
 | `SyncFailure` (non-retryable/max) + `markDeadLetter` succeeds | Operation dead-lettered | `deadLetter` | `deadLettered++` |
@@ -1999,7 +2023,7 @@ that abort the cycle.
 | Connectivity subscription fails (in `start`) | `start` throws, cleanup, `_started` remains `false` | — | — |
 | Connectivity sampling fails (in `start`) | `start` throws, cleanup, `_started` remains `false` | — | — |
 | Connectivity lost mid-push | Push fails with network error → retry policy | Per retry policy | `failed++` or `deadLettered++` or `storageErrors++` |
-| Remote push succeeds but `markSucceeded` fails | Operation may be re-pushed on next cycle (recovery) | **Unknown** — may be `inFlight`, `pending`, or removed | `storageErrors++` |
+| Remote push succeeds but `markSucceeded` fails | **Phase 3.1:** cycle aborts with `cycleError`; no outcome counter. **Phase 3.2+:** report `storageErrors++` and continue. Recovery retries only if the operation remains `inFlight` | **Unknown** — may be `inFlight`, `pending`, or removed | Phase-specific as above |
 | App terminated mid-push | OS kills process | `inFlight` → recovered on next `start()` | — |
 | `dispose()` during startup | Set `_disposeRequested`, await startup cleanup, proceed with disposal | Depends on startup outcome | — |
 | `dispose()` during cycle | Set `_disposeRequested`, wait for cycle to complete (no timeout), close streams | `inFlight` ops recovered on next `start()` | — |
@@ -2025,21 +2049,35 @@ that abort the cycle.
   the entire cycle rather than affecting one operation's post-push
   transition.
 
-**Operation-level storage failures (increment `storageErrors`, continue
-cycle):**
-- `markSucceeded` throws → persisted state **unknown**. The operation
-  may or may not have been removed. Entity is blocked for rest of cycle.
-  Other operations in the chunk can continue.
-- `markFailed` throws → persisted state **unknown**. Entity is blocked.
-- `markDeadLetter` throws → persisted state **unknown**. Entity is
-  blocked. For conflicts, no event is emitted.
+**Phase 3.1 interim behavior — `markSucceeded` failure:**
+- `markSucceeded` throws → set `cycleError`, rethrow through
+  `Future.wait`, and abort the cycle after the current chunk settles.
+  Do not increment `succeeded` or `storageErrors`. The persisted state
+  is **unknown**; it may be `inFlight`, `pending`, or removed. The next
+  `start()` attempts recovery only if the operation is still `inFlight`.
 
-**Reporting rule:** `succeeded`, `failed`, `deadLettered`, and
-`conflicted` increment **only** when their storage transition completes
-without throwing. When a transition throws, `storageErrors` increments
-instead — the counters are mutually exclusive per operation outcome.
-`isSuccess` is `false` whenever `storageErrors > 0`, so a report can
-never indicate success when an operation-level storage failure occurred.
+**Phase 3.2+ operation-level storage failures (increment
+`storageErrors`, continue cycle):**
+- `markSucceeded` throws → persisted state **unknown**. Do not increment
+  `succeeded`; increment `storageErrors`. Other operations in the
+  chunk can continue. Phase 3.4 also blocks the entity for the rest of
+  the cycle.
+- `markFailed` throws → persisted state **unknown**; increment
+  `storageErrors`. Phase 3.4 blocks the entity.
+- `markDeadLetter` throws → persisted state **unknown**; increment
+  `storageErrors`. Phase 3.4 blocks the entity. For conflicts, no event
+  is emitted.
+
+**Target-state reporting rule:** `succeeded`, `failed`, `deadLettered`,
+and `conflicted` increment **only** when their storage transition
+completes without throwing. From Phase 3.2, an operation-level transition
+failure increments `storageErrors` instead — the counters are mutually
+exclusive per operation outcome and `isSuccess` is false.
+
+**Phase 3.1 exception:** a `markSucceeded` failure sets `cycleError`
+and aborts the cycle after the current chunk settles. Neither
+`succeeded` nor `storageErrors` increments; `isSuccess` is false
+because `cycleError != null`.
 
 **Rationale:** `markInFlight` is the claiming mechanism. If it fails,
 the engine cannot know whether the operation was claimed by this engine,
@@ -2098,9 +2136,11 @@ remote effects.
   pushes are started for the affected chunk. Represented by `cycleError`.
 - **All chunk claims before pushes.** All `markInFlight` calls for a
   chunk must succeed before any `remoteSync.push` is called.
-- **Same-cycle retries are impossible.** The fixed eligibility cutoff
-  and `attemptedOperationIds` set prevent an operation from being
-  attempted more than once per cycle.
+- **Same-cycle retries are prevented from Phase 3.2.** The fixed
+  eligibility cutoff and `attemptedOperationIds` set prevent an
+  operation from being attempted more than once per cycle. Phase 3.1
+  uses the current clock time for each fetch and does not implement the
+  fixed-cutoff or attempted-ID guard.
 - **Entity blocking is cycle-scoped.** After failure/conflict/storage-
   error, the entity is blocked for the rest of the cycle. After success,
   the entity is unblocked.
@@ -2600,12 +2640,18 @@ failure reporting, and retry-policy exception semantics.
   `inFlight`; recovered next `start()`; no outcome counter
 - Numeric overflow prevention for large attempt counts
 - `attemptCount >= 1` validation
-- Same-cycle retry prevention (fixed eligibility cutoff)
-- **Operation-level storage failure reporting:** `markSucceeded`/
-  `markFailed`/`markDeadLetter` throwing → `storageErrors++`,
-  `isSuccess == false`, persisted state unknown
-- Remote push succeeds but `markSucceeded` fails → re-push on recovery,
-  `storageErrors++` in originating cycle's report
+- **Basic Phase 3.1 fetch-time semantics:** each fetch samples
+  `clock.now()` independently; no cycle-wide cutoff exists yet.
+- Same-cycle retry prevention (fixed eligibility cutoff) — Phase 3.2;
+  verify that the captured cycle-start cutoff is reused for every fetch.
+- **Operation-level storage failure reporting (Phase 3.2):**
+  `markSucceeded`/`markFailed`/`markDeadLetter` throwing →
+  `storageErrors++`, `isSuccess == false`, persisted state unknown.
+- **Phase 3.1 `markSucceeded` failure:** cycle-level `cycleError`,
+  abort after current chunk settles, no `storageErrors` increment.
+- Remote push succeeds but `markSucceeded` fails → recovery retries
+  only if still `inFlight`; Phase 3.1 reports `cycleError`, Phase 3.2
+  reports `storageErrors++`.
 - All error handling matrix scenarios
 
 ### Phase 3.3 — Conflict Handling
