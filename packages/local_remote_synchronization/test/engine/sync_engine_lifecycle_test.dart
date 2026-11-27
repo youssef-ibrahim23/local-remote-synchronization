@@ -272,6 +272,52 @@ void main() {
       expect(emitted.length, 1);
     });
 
+    test('dispose while a connectivity-triggered sync is pending', () async {
+      // syncOnStart: false, syncOnConnectivityRestore: true, offline.
+      await engine.dispose();
+      await connectivity.close();
+      engine = buildEngine(
+        config: manualConfig(syncOnConnectivityRestore: true),
+        online: false,
+      );
+      await engine.start();
+      expect(storage.fetchCalls, 0);
+
+      final emitted = <SyncCycleReport>[];
+      final reportsDone = Completer<void>();
+      final sub = engine.reports.listen(
+        emitted.add,
+        onDone: reportsDone.complete,
+      );
+
+      // Queue an online event and request disposal in the same
+      // synchronous turn — before the broadcast event can be delivered
+      // to the engine's listener. The listener's _disposeRequested
+      // guard drops it even if delivery wins the race.
+      connectivity.emit(true);
+      final disposeFuture = engine.dispose();
+      await disposeFuture;
+      await reportsDone.future;
+      await sub.cancel();
+
+      // The pending trigger never started a cycle.
+      expect(storage.fetchCalls, 0);
+      expect(remote.pushCalls, 0);
+      expect(emitted, isEmpty);
+      expect(engine.isRunning, isFalse);
+      // The connectivity subscription was cancelled during disposal.
+      expect(connectivity.cancelCount, greaterThanOrEqualTo(1));
+      expect(() => engine.syncNow(), throwsStateError);
+
+      // No cycle can start after disposal — events have no listener and
+      // every entry point is guarded.
+      connectivity.emit(false);
+      connectivity.emit(true);
+      expect(storage.fetchCalls, 0);
+      expect(remote.pushCalls, 0);
+      expect(emitted, isEmpty);
+    });
+
     test('sequential offline syncNow calls produce distinct reports', () async {
       // Rebuild offline with manual triggers disabled.
       await engine.dispose();
