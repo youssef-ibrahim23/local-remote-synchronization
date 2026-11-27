@@ -1,6 +1,6 @@
 # Phase 3 — Sync Engine Architecture
 
-> **Status:** Design proposal — revised after fourth architecture review.
+> **Status:** Design proposal — revised after final architecture review.
 >
 > **Scope:** Push-only synchronization orchestration. No pull, no conflict
 > resolution strategies, no background scheduling, no Flutter lifecycle.
@@ -208,14 +208,18 @@ final class SyncEngine {
   /// [localStorage] — durable outbox adapter (Sqflite, Drift, Hive, ...).
   /// [remoteSync] — remote push adapter (Supabase, REST, ...).
   /// [connectivity] — connectivity provider for auto-sync triggers.
-  /// [config] — engine configuration (defaults provided, validated).
+  /// [config] — engine configuration. When `null`, a default
+  ///   [SyncEngineConfig] is created internally. [SyncEngineConfig]'s
+  ///   constructor performs runtime validation (`batchSize > 0`,
+  ///   `maxConcurrency > 0`), so it is **not** a const constructor and
+  ///   cannot be used as a default parameter value.
   /// [retryPolicy] — retry strategy (defaults to
   ///   [ExponentialBackoffRetryPolicy]).
   SyncEngine({
     required LocalStorageAdapter localStorage,
     required RemoteSyncAdapter remoteSync,
     required ConnectivityProvider connectivity,
-    SyncEngineConfig config = const SyncEngineConfig(),
+    SyncEngineConfig? config,
     RetryPolicy? retryPolicy,
   });
 
@@ -419,6 +423,15 @@ final class SyncEngineConfig {
 /// Both methods validate that [attemptCount] is >= 1. The engine
 /// guarantees this by passing `op.attemptCount + 1` (where
 /// `op.attemptCount` starts at 0).
+///
+/// **Exception semantics:** Implementations should treat a throw from
+/// either method as a programmer error, not a transient condition. The
+/// engine does **not** catch policy exceptions per-operation — they
+/// propagate to the cycle error boundary, which aborts the cycle with
+/// `cycleError` set (see Section 8). Rationale: a broken policy affects
+/// every failed operation identically, and the engine cannot determine
+/// the correct storage transition without a delay/dead-letter decision.
+/// Aborting is consistent with the `markInFlight` failure policy.
 abstract interface class RetryPolicy {
   /// Computes the delay before the next retry attempt.
   ///
@@ -430,6 +443,12 @@ abstract interface class RetryPolicy {
   /// as a minimum delay — local backoff and jitter must not produce a
   /// delay shorter than `retryAfter`. A server-provided `retryAfter`
   /// larger than any local `maxDelay` is preserved.
+  ///
+  /// If this method throws, the exception propagates to the cycle error
+  /// boundary: the cycle aborts with `cycleError`, the operation remains
+  /// `inFlight` (claimed, result received, no transition applied), and it
+  /// is recovered to `pending` on the next [SyncEngine.start]. No outcome
+  /// counter is incremented for it.
   Duration computeDelay(int attemptCount, SyncError error);
 
   /// Returns `true` if the operation should be moved to `deadLetter`
@@ -437,6 +456,9 @@ abstract interface class RetryPolicy {
   ///
   /// [attemptCount] is the number of completed push attempts. Must be >= 1.
   /// [error] is the [SyncError] that caused the failure.
+  ///
+  /// If this method throws, the exception propagates to the cycle error
+  /// boundary with the same semantics as [computeDelay].
   bool shouldDeadLetter(int attemptCount, SyncError error);
 }
 ```
@@ -471,7 +493,7 @@ abstract interface class RetryPolicy {
 ///   attempt 3 → ~4s   (3.2s – 4.8s)
 ///   attempt 4 → ~8s   (6.4s – 9.6s)
 ///   ...
-///   attempt 10 → ~5m  (4m – 6m, capped at maxDelay=5m)
+///   attempt 10 → ~5m  (4m – 5m, jittered then capped at maxDelay=5m)
 ///
 /// If error.retryAfter = 10m (> maxDelay=5m):
 ///   return 10m  (server suggestion preserved, not capped by maxDelay)
@@ -1186,6 +1208,12 @@ _pushAndHandle(op, acc, entityBlocked):
   │       final error = result.error
   │       final newAttemptCount = op.attemptCount + 1
   │       entityBlocked.add(entityKey)  ← block entity for rest of cycle
+  │       // NOTE: retryPolicy calls are NOT wrapped in try/catch.
+  │       // A throw propagates through Future.wait to the cycle error
+  │       // boundary → cycleError set, cycle aborts after the current
+  │       // chunk's pushes settle. This op remains inFlight (claimed,
+  │       // result received, no transition applied) → recovered to
+  │       // pending on next start. No outcome counter is incremented.
   │       if (retryPolicy.shouldDeadLetter(newAttemptCount, error)) {
   │         try {
   │           await localStorage.markDeadLetter(
@@ -1868,6 +1896,8 @@ that abort the cycle.
 | `SyncResult.operationId` mismatch + `markDeadLetter` succeeds | Immediate dead-letter (non-retryable), block entity | `deadLetter` | `deadLettered++` |
 | `SyncResult.operationId` mismatch + `markDeadLetter` throws | Block entity, log warning | **Unknown** | `storageErrors++` |
 | `RemoteSyncAdapter.push` throws | Treat as `SyncFailure(unknown, isRetryable: true)` | Per retry policy | `failed++` or `deadLettered++` or `storageErrors++` |
+| `retryPolicy.shouldDeadLetter` throws | Exception propagates → **cycle aborts** with `cycleError` after current chunk settles; no transition applied to this op | Op remains `inFlight` → recovered on next `start()`; other chunk ops complete normally | `cycleError` set; no outcome counter for this op |
+| `retryPolicy.computeDelay` throws | Same as `shouldDeadLetter` throw | Same | `cycleError` set; no outcome counter for this op |
 | `markInFlight` throws (first in chunk) | **Abort cycle** with `cycleError`, no pushes | **Unknown** for failed op; previously claimed ops remain `inFlight` or unknown | `cycleError` set |
 | `markInFlight` throws (middle in chunk) | **Abort cycle**, no pushes for this chunk | **Unknown** for failed op; previously claimed ops in chunk remain `inFlight` or unknown | `cycleError` set |
 | `markInFlight` throws (last in chunk) | **Abort cycle**, no pushes for this chunk | **Unknown** for failed op; all other ops in chunk remain `inFlight` or unknown | `cycleError` set |
@@ -1932,6 +1962,23 @@ remote adapter and backend enforce idempotency keys. Having an
 `idempotencyKey` field in Core does not automatically prevent duplicate
 remote effects.
 
+**Non-storage cycle-aborting faults:**
+- `RetryPolicy.shouldDeadLetter` or `RetryPolicy.computeDelay` throws →
+  the exception propagates through `Future.wait` (which waits for all
+  chunk pushes to settle before propagating the first error) to the
+  cycle error boundary → `cycleError` set, cycle aborts. The affected
+  operation remains `inFlight` — it was claimed and its push result was
+  received, but no storage transition was applied because the engine
+  could not determine the correct one. It is recovered to `pending` on
+  the next `start()` and retried. **No outcome counter is incremented**
+  for it (`storageErrors` is reserved for storage transition failures,
+  not policy faults). Other operations in the chunk that already
+  received results complete their transitions normally. Rationale: a
+  throwing policy is a programmer/configuration fault that would affect
+  every failed operation identically; per-operation handling cannot
+  determine the correct transition, so aborting is the only safe choice
+  — consistent with the `markInFlight` failure policy.
+
 ### Key invariants
 
 - **No operation disappears** due to an unhandled exception. Every code
@@ -1962,6 +2009,12 @@ remote effects.
 - **Entity blocking is cycle-scoped.** After failure/conflict/storage-
   error, the entity is blocked for the rest of the cycle. After success,
   the entity is unblocked.
+- **RetryPolicy exceptions abort the cycle, not the operation.** A throw
+  from `shouldDeadLetter`/`computeDelay` propagates to the cycle error
+  boundary → `cycleError`, cycle aborts after the current chunk settles.
+  The affected operation remains `inFlight` and is recovered on next
+  `start()` — it is retried, never silently dropped or dead-lettered by
+  a policy fault.
 - **Unexpected exceptions are retryable.** Conservative default — better
   to retry than to lose an operation.
 
@@ -2348,20 +2401,32 @@ These are documented for future phases but not required now.
 
 ## 12. Proposed Implementation Breakdown
 
-### Phase 3.1 — Core Engine Skeleton
+Phases are sequential and non-overlapping. Each phase builds on the
+previous one's working engine; later phases add result-handling branches
+and verification, not rework.
+
+### Phase 3.1 — Engine Foundation
+
+Lifecycle, startup/disposal, connectivity monitoring, single-flight
+cycle reservation, basic fetching and successful push, immutable cycle
+reports, and basic concurrency with storage claiming. **No retry
+algorithm, no conflict workflow, no per-entity ordering guard** — those
+land in 3.2–3.4.
 
 **Files to create:**
 - `lib/src/engine/sync_engine.dart` — main engine class
 - `lib/src/engine/sync_engine_config.dart` — configuration with validation
 - `lib/src/engine/sync_cycle_report.dart` — report value object
-- `lib/src/engine/sync_conflict_event.dart` — conflict event
-- `lib/src/engine/retry_policy.dart` — interface
-- `lib/src/engine/exponential_backoff_retry_policy.dart` — default impl
 - Update `lib/local_remote_synchronization.dart` — export new types
 
 **Internal (not exported):**
 - `_CycleSlot` — synchronous cycle reservation token
 - `_CycleAccumulator` — mutable per-cycle statistics accumulator
+
+**Constructor note:** `SyncEngine` in this phase accepts
+`localStorage`, `remoteSync`, `connectivity`, and `config`. The
+`retryPolicy` parameter and `RetryPolicy` type are introduced in
+Phase 3.2 together with failure handling.
 
 **Tests:**
 - Engine lifecycle (start, syncNow, dispose)
@@ -2374,36 +2439,41 @@ These are documented for future phases but not required now.
 - `dispose()` during startup — **deterministic test with
   `recoverInFlightOperations()` pending via Completer**
 - `dispose()` concurrent calls share one disposal
+- `dispose()` during active cycle (no timeout, waits for completion)
+- **Dispose with pending auto-trigger** — no cycle starts, no emit after close
 - Single-flight cycle reservation (concurrent `syncNow` calls share slot)
 - **Two sequential offline `syncNow()` calls** — distinct report instances,
   separate cycles, slot cleared between calls
 - Cycle completing before completer awaited — report still delivered
-- Basic sync cycle with mock adapters
+- Basic sync cycle with mock adapters (fetch → claim → push →
+  `markSucceeded`)
+- `SyncResult.operationId` validated before `markSucceeded`
 - Connectivity-triggered sync
 - Connectivity event buffering during startup (synchronous + async)
-- Result `operationId` validation (mismatch → immediate dead-letter;
-  `deadLettered++` on success, `storageErrors++` on failure)
-- Configuration validation (batchSize, maxConcurrency, retry policy args)
+- Configuration validation (batchSize, maxConcurrency)
 - `markInFlight` failure aborts cycle (first, middle, last in chunk)
 - `markInFlight` failure: no pushes started for chunk
-- Same-cycle retry prevention (fixed eligibility cutoff)
-- Per-entity ordering guard with `jsonEncode` keys
-- Entity blocking across cycle (failure → blocked, success → unblocked)
-- Collision-safe entity keys (entityType/entityId with `:`)
-- **Storage transition failures:** `markSucceeded`/`markFailed`/
-  `markDeadLetter` throwing → `storageErrors++`, `isSuccess == false`,
-  entity blocked, persisted state unknown
+- Basic chunked concurrency (`maxConcurrency` parallel pushes)
 - **Report immutability:** exactly one `SyncCycleReport` instance per
   cycle; same instance returned by `syncNow()` and emitted on `reports`;
   `completedAt` always populated
 - **`isSuccess` semantics:** `skippedOffline` → `isSuccess == true` but
-  `succeeded == 0`; `storageErrors > 0` → `isSuccess == false`
+  `succeeded == 0`
 
 ### Phase 3.2 — Retry and Failure Handling
 
+`RetryPolicy` contract, exponential backoff with jitter, retry
+scheduling, non-retryable failures, max-attempt and dead-letter
+decisions, result-mismatch dead-lettering, operation-level storage
+failure reporting, and retry-policy exception semantics.
+
+**Files to create:**
+- `lib/src/engine/retry_policy.dart` — interface
+- `lib/src/engine/exponential_backoff_retry_policy.dart` — default impl
+
 **Files to modify:**
-- `lib/src/engine/sync_engine.dart` — add retry logic
-- `lib/src/engine/exponential_backoff_retry_policy.dart` — refine algorithm
+- `lib/src/engine/sync_engine.dart` — add `retryPolicy` constructor
+  parameter and `SyncFailure` handling branch
 
 **Tests:**
 - Exponential backoff timing
@@ -2411,22 +2481,36 @@ These are documented for future phases but not required now.
 - `jitterFactor = 1.0` produces strictly positive delay <= maxDelay
 - `retryAfter` as minimum (not shortened by backoff/jitter)
 - `retryAfter > maxDelay` is preserved (not capped)
+- Retry scheduling via `markFailed` + `nextRetryAt`
 - Max attempts → dead-letter
 - Non-retryable → immediate dead-letter
+- Result `operationId` mismatch → immediate dead-letter
+  (`deadLettered++` on success, `storageErrors++` on failure)
+- **RetryPolicy exceptions:** `shouldDeadLetter`/`computeDelay` throwing
+  → cycle aborts with `cycleError` after chunk settles; op remains
+  `inFlight`; recovered next `start()`; no outcome counter
 - Numeric overflow prevention for large attempt counts
 - `attemptCount >= 1` validation
-- Same-cycle retry prevention
-- All error handling matrix scenarios
-- Storage transition failure → `storageErrors++`, persisted state unknown
+- Same-cycle retry prevention (fixed eligibility cutoff)
+- **Operation-level storage failure reporting:** `markSucceeded`/
+  `markFailed`/`markDeadLetter` throwing → `storageErrors++`,
+  `isSuccess == false`, persisted state unknown
 - Remote push succeeds but `markSucceeded` fails → re-push on recovery,
   `storageErrors++` in originating cycle's report
+- All error handling matrix scenarios
 
 ### Phase 3.3 — Conflict Handling
 
+`SyncConflict` detection, durable dead-letter transition, conflict event
+emission, and delivery limitations. **No conflict-resolution workflow.**
+
+**Files to create:**
+- `lib/src/engine/sync_conflict_event.dart` — conflict event
+
 **Files to modify:**
-- `lib/src/engine/sync_engine.dart` — add conflict detection, ordered
-  persistence, and event emission
-- `lib/src/engine/sync_conflict_event.dart` — finalize
+- `lib/src/engine/sync_engine.dart` — add `conflicts` stream and
+  `SyncConflict` handling branch
+- `lib/local_remote_synchronization.dart` — export `SyncConflictEvent`
 
 **Tests:**
 - Conflict event emitted only after `markDeadLetter` completes without throwing
@@ -2437,26 +2521,32 @@ These are documented for future phases but not required now.
 - `report.conflicted` is subset of `report.deadLettered`
 - `SyncConflictEvent.operation` is pre-transition snapshot (status != deadLetter)
 - No conflict-resolution workflow advertised
-- Entity blocked after conflict for rest of cycle
 
 ### Phase 3.4 — Concurrency and FIFO Verification
 
+Per-entity ordering guard, entity outcome blocking, batch/concurrency
+limit verification, adapter edge cases, and cross-instance limitations.
+
 **Files to modify:**
-- `lib/src/engine/sync_engine.dart` — verify batch/concurrency logic
+- `lib/src/engine/sync_engine.dart` — add/verify per-entity ordering
+  guard (`jsonEncode` keys, group-sort-select) and `entityBlocked`
+  tracking
 
 **Tests:**
 - Per-entity ordering guard (no concurrent pushes for same entity)
 - Cross-entity parallelism
 - Batch size limits
 - Max concurrency limits
-- Failed operation blocks entity but not others
-- Dead-letter blocks entity permanently
-- Result `operationId` mismatch handling (both storage outcomes)
-- Fixed eligibility cutoff prevents same-cycle retries
+- Entity blocking across cycle: failure → blocked; dead-letter →
+  blocked permanently; success → unblocked for later fetch
+- Storage-transition failure → entity blocked for rest of cycle
 - Adapter returning multiple ops per entity → guard selects earliest
-- Entity unblocked after successful `markSucceeded`
-- Entity blocked after failed storage transition
-- Collision-safe entity keys with special characters
+  by `(sequenceNumber, createdAt, operationId)`
+- Collision-safe entity keys with special characters (`:` in
+  entityType/entityId)
+- FIFO limitation documentation verified against Sqflite/Drift/Hive
+  null-sequence-number behavior
+- Cross-instance race documented (no atomic claiming)
 
 ### Phase 3.5 — Integration Tests
 
@@ -2464,13 +2554,13 @@ These are documented for future phases but not required now.
 - `test/engine/sync_engine_integration_test.dart` — end-to-end with real adapters
 
 **Tests:**
-- Full sync cycle with Sqflite adapter + mock remote
+- Full sync cycle with Sqflite adapter + mock remote (success, failure
+  with retry across cycles, conflict, dead-letter)
 - Crash recovery (inFlight → pending → retry on next start)
 - Remote push succeeds but `markSucceeded` fails → re-push on recovery
 - Connectivity loss during push
 - Disposal during active cycle (no timeout, waits for completion)
 - **Disposal during `recoverInFlightOperations()` pending**
-- **Dispose with pending auto-trigger** — no cycle starts, no emit after close
 - Multiple sequential cycles
 - `start()` failure and retry (including partial recovery)
 - Connectivity event buffering during startup (sync + async events)
@@ -2620,3 +2710,6 @@ warrant separate ADR files:
 | `fetched` counts raw adapter results | Before filtering; not unique operations selected for pushing |
 | No auto-sync on enqueue (watchPendingCount) | Avoids sync storms; apps can call syncNow() explicitly |
 | One engine per outbox recommended | Current contract lacks atomic claiming; idempotency enforcement is adapter/backend-dependent |
+| `SyncEngine` accepts `SyncEngineConfig?` (nullable) | `SyncEngineConfig` has runtime validation → non-const constructor → cannot be a default parameter value; engine resolves default internally |
+| RetryPolicy exceptions abort the cycle | Policy fault affects all ops identically; engine cannot determine correct transition; op stays `inFlight` → recovered next `start()`; consistent with `markInFlight` abort policy |
+| Phases 3.1–3.6 sequential and non-overlapping | 3.1 foundation only; retry/conflict/FIFO verification land in their own phases |
