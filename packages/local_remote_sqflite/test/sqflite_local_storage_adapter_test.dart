@@ -1,5 +1,7 @@
+import 'dart:async';
 import 'dart:io';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:local_remote_sqflite/local_remote_sqflite.dart';
 import 'package:local_remote_synchronization/local_remote_synchronization.dart';
@@ -396,11 +398,23 @@ void main() {
 
       final listener1 = <int>[];
       final listener2 = <int>[];
+      final completer1 = Completer<void>();
+      final completer2 = Completer<void>();
 
       // Start listening and immediately enqueue without awaiting initial count
       // so the mutation races with initial _queryPendingCount().
-      final sub1 = adapter.watchPendingCount().listen(listener1.add);
-      final sub2 = adapter.watchPendingCount().listen(listener2.add);
+      final sub1 = adapter.watchPendingCount().listen(
+        (count) {
+          listener1.add(count);
+          if (count == 1) completer1.complete();
+        },
+      );
+      final sub2 = adapter.watchPendingCount().listen(
+        (count) {
+          listener2.add(count);
+          if (count == 1) completer2.complete();
+        },
+      );
       addTearDown(sub1.cancel);
       addTearDown(sub2.cancel);
 
@@ -413,13 +427,132 @@ void main() {
           ),
         ),
       );
-      await Future<void>.delayed(const Duration(milliseconds: 20));
 
-      // Neither listener may miss 1 or emit a stale 0 after 1.
-      expect(listener1, isNotEmpty);
-      expect(listener1.last, 1);
-      expect(listener2, isNotEmpty);
-      expect(listener2.last, 1);
+      // Wait until both listeners receive the final count (1).
+      await completer1.future.timeout(const Duration(seconds: 1));
+      await completer2.future.timeout(const Duration(seconds: 1));
+
+      // Verify acceptable sequences: [0, 1] or [1], but reject [1, 0] or
+      // [0, 1, 0].
+      final sequencesMatch1 = listEquals(listener1, <int>[0, 1]) ||
+          listEquals(listener1, <int>[1]);
+      final sequencesMatch2 = listEquals(listener2, <int>[0, 1]) ||
+          listEquals(listener2, <int>[1]);
+      expect(sequencesMatch1, isTrue,
+          reason: 'listener1 sequence $listener1 is not acceptable');
+      expect(sequencesMatch2, isTrue,
+          reason: 'listener2 sequence $listener2 is not acceptable');
+    });
+
+    test(
+        'outboxFor with external transaction requires manual '
+        'refreshPendingCount',
+        () async {
+      final db = await openTestDb();
+      final adapter = SqfliteLocalStorageAdapter(
+        database: db,
+        operationIdGenerator: () => 'op-external-1',
+      );
+      addTearDown(() async {
+        await adapter.dispose();
+        await db.close();
+      });
+
+      final emitted = <int>[];
+      final sub = adapter.watchPendingCount().listen(emitted.add);
+      addTearDown(sub.cancel);
+
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+      expect(emitted, <int>[0]);
+
+      // Use outboxFor within an external transaction.
+      await db.transaction((txn) async {
+        final outbox = adapter.outboxFor(txn);
+        await outbox.enqueue(
+          LocalMutation(
+            entityType: 'tasks',
+            entityId: 't-external',
+            type: SyncOperationType.create,
+            payload: const <String, dynamic>{'title': 'External'},
+          ),
+        );
+      });
+
+      // Count should NOT update automatically after external transaction
+      // commits.
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+      expect(emitted, <int>[0]);
+
+      // Manual refresh updates the count.
+      await adapter.refreshPendingCount();
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+      expect(emitted, <int>[0, 1]);
+    });
+
+    test('runWithTransaction automatically notifies after commit', () async {
+      final db = await openTestDb();
+      final adapter = SqfliteLocalStorageAdapter(
+        database: db,
+        operationIdGenerator: () => 'op-auto-1',
+      );
+      addTearDown(() async {
+        await adapter.dispose();
+        await db.close();
+      });
+
+      final emitted = <int>[];
+      final sub = adapter.watchPendingCount().listen(emitted.add);
+      addTearDown(sub.cancel);
+
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+      expect(emitted, <int>[0]);
+
+      // runWithTransaction should automatically notify.
+      await adapter.runWithTransaction((txn, outbox) async {
+        await txn.insert('tasks', <String, Object?>{
+          'id': 't-auto',
+          'title': 'Auto',
+        });
+        await outbox.enqueue(
+          LocalMutation(
+            entityType: 'tasks',
+            entityId: 't-auto',
+            type: SyncOperationType.create,
+            payload: const <String, dynamic>{'title': 'Auto'},
+          ),
+        );
+      });
+
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+      expect(emitted, <int>[0, 1]);
+    });
+
+    test('watchPendingCount stream completes after adapter disposal', () async {
+      final db = await openTestDb();
+      final adapter = SqfliteLocalStorageAdapter(database: db);
+      addTearDown(() async {
+        await db.close();
+      });
+
+      final completed = Completer<void>();
+      final emitted = <int>[];
+      final sub = adapter.watchPendingCount().listen(
+            emitted.add,
+            onDone: completed.complete,
+            onError: completed.completeError,
+          );
+
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+      expect(emitted, <int>[0]);
+
+      // Dispose the adapter.
+      await adapter.dispose();
+
+      // Stream should complete.
+      await completed.future.timeout(const Duration(seconds: 1));
+
+      // Cancel subscription after completion (safe to call).
+      await sub.cancel();
     });
 
     test('failed retry eligibility requires nextRetryAt <= now and non-null',

@@ -68,12 +68,31 @@ final class SqfliteLocalStorageAdapter implements LocalStorageAdapter {
   }
 
   /// Returns an [OutboxWriter] bound to an existing Sqflite [txn].
+  ///
+  /// Use this when you already have an open Sqflite transaction and need to
+  /// enqueue operations within it. The returned writer does not automatically
+  /// notify [watchPendingCount] listeners after enqueue — you must call
+  /// [refreshPendingCount] after your transaction commits to update listeners.
+  ///
+  /// For automatic notification, prefer [runWithTransaction] or
+  /// [runInTransaction].
   OutboxWriter outboxFor(Transaction txn) => SqfliteOutboxWriter(
         executor: txn,
         tableName: _tableName,
         operationIdGenerator: _operationIdGenerator,
         clock: _clock,
       );
+
+  /// Manually refreshes the pending count and notifies [watchPendingCount]
+  /// listeners.
+  ///
+  /// Call this after using [outboxFor] within an external Sqflite transaction
+  /// that you manage yourself. This method queries the current pending count
+  /// and emits it to all active listeners.
+  ///
+  /// Not needed when using [runWithTransaction] or [runInTransaction] — those
+  /// methods handle notification automatically.
+  Future<void> refreshPendingCount() => _emitPendingCount();
 
   @override
   Future<T> runInTransaction<T>(
@@ -265,6 +284,11 @@ final class SqfliteLocalStorageAdapter implements LocalStorageAdapter {
           onError: (Object error, StackTrace stackTrace) {
             if (!controller.isClosed) {
               controller.addError(error, stackTrace);
+            }
+          },
+          onDone: () {
+            if (!controller.isClosed) {
+              controller.close();
             }
           },
         );
