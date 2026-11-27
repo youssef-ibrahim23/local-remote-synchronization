@@ -71,7 +71,9 @@ await localStorage.runWithTransaction((txn, outbox) async {
 ```
 
 If you already opened a `db.transaction((txn) ...)` block, use
-`localStorage.outboxFor(txn)` to obtain an `OutboxWriter` bound to `txn`.
+`localStorage.outboxFor(txn)` to obtain an `OutboxWriter` bound to `txn`, and
+call `await localStorage.refreshPendingCount()` after the transaction commits
+to notify `watchPendingCount()` listeners.
 
 > **Note:** `runWithTransaction` and `outboxFor` are specific to the Sqflite
 > adapter. Core remains database-agnostic and does not expose Sqflite types.

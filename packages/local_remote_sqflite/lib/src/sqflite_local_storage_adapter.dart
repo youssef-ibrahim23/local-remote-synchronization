@@ -69,13 +69,12 @@ final class SqfliteLocalStorageAdapter implements LocalStorageAdapter {
 
   /// Returns an [OutboxWriter] bound to an existing Sqflite [txn].
   ///
-  /// Use this when you already have an open Sqflite transaction and need to
-  /// enqueue operations within it. The returned writer does not automatically
-  /// notify [watchPendingCount] listeners after enqueue — you must call
-  /// [refreshPendingCount] after your transaction commits to update listeners.
-  ///
-  /// For automatic notification, prefer [runWithTransaction] or
-  /// [runInTransaction].
+  /// Because [txn] is managed externally and has not yet committed when
+  /// [OutboxWriter.enqueue] runs, this writer does not emit
+  /// [watchPendingCount] updates automatically. After your external
+  /// `db.transaction(...)` commits, call [refreshPendingCount] to notify
+  /// active listeners. Prefer [runWithTransaction] when automatic notification
+  /// is desired.
   OutboxWriter outboxFor(Transaction txn) => SqfliteOutboxWriter(
         executor: txn,
         tableName: _tableName,
@@ -83,15 +82,12 @@ final class SqfliteLocalStorageAdapter implements LocalStorageAdapter {
         clock: _clock,
       );
 
-  /// Manually refreshes the pending count and notifies [watchPendingCount]
+  /// Queries the current outbox count and notifies active [watchPendingCount]
   /// listeners.
   ///
-  /// Call this after using [outboxFor] within an external Sqflite transaction
-  /// that you manage yourself. This method queries the current pending count
-  /// and emits it to all active listeners.
-  ///
-  /// Not needed when using [runWithTransaction] or [runInTransaction] — those
-  /// methods handle notification automatically.
+  /// Call this after committing an external `db.transaction(...)` that used
+  /// [outboxFor]. Never call this while an external transaction is still open
+  /// if you want to avoid querying uncommitted state.
   Future<void> refreshPendingCount() => _emitPendingCount();
 
   @override
@@ -288,7 +284,7 @@ final class SqfliteLocalStorageAdapter implements LocalStorageAdapter {
           },
           onDone: () {
             if (!controller.isClosed) {
-              controller.close();
+              unawaited(controller.close());
             }
           },
         );
@@ -296,6 +292,12 @@ final class SqfliteLocalStorageAdapter implements LocalStorageAdapter {
         final initialVersion = _pendingCountVersion;
         try {
           final initialCount = await _queryPendingCount();
+          if (_disposed) {
+            if (!controller.isClosed) {
+              await controller.close();
+            }
+            return;
+          }
           if (!controller.isClosed &&
               !receivedLiveUpdate &&
               initialVersion == _pendingCountVersion) {
