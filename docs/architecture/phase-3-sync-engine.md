@@ -1986,9 +1986,11 @@ updates. They are documented as future enhancements, **not Phase 3 scope**.
 
 Counter legend: `succeeded`/`failed`/`deadLettered`/`conflicted` increment
 **only after** the named storage transition completes without throwing.
-`storageErrors` increments when a post-push storage transition throws
-(persisted state unknown). `cycleError` is set for cycle-level failures
-that abort the cycle.
+From Phase 3.2, `storageErrors` increments when a post-push storage
+transition throws (persisted state unknown). In Phase 3.1,
+`markSucceeded` throwing instead sets `cycleError` and aborts the
+cycle after the current chunk settles. Other cycle-level failures also
+set `cycleError`.
 
 > Rows describe **target-state** behavior (post-Phase 3.4). Retry-related
 > rows apply from Phase 3.2, conflict rows from Phase 3.3, and
@@ -2081,12 +2083,14 @@ because `cycleError != null`.
 
 **Rationale:** `markInFlight` is the claiming mechanism. If it fails,
 the engine cannot know whether the operation was claimed by this engine,
-another engine, or no one. Aborting is the only safe choice. Post-push
-transitions (`markSucceeded`, `markFailed`, `markDeadLetter`) are safe
-to continue past because the operation's persisted state is unknown and
-will be handled by recovery on next `start()` if still `inFlight` — but
-this does **not** guarantee the operation stays `inFlight`. The engine
-reports these as `storageErrors` rather than silently continuing.
+another engine, or no one. Aborting is the only safe choice. A failed
+post-push transition (`markSucceeded`, `markFailed`, or
+`markDeadLetter`) also leaves persisted state unknown and does not
+prove the operation remains `inFlight`. In Phase 3.1, the
+`markSucceeded` failure aborts the cycle with `cycleError`. From
+Phase 3.2, post-push transition failures are reported as
+`storageErrors` and the cycle continues; recovery on the next
+`start()` can reset the operation only if it is still `inFlight`.
 
 **Idempotency caveat:** Recovery and re-push are safe **only if** the
 remote adapter and backend enforce idempotency keys. Having an
@@ -2116,9 +2120,10 @@ remote effects.
   path either marks the operation or leaves it in a recoverable or
   unknown state. A failed storage transition means the persisted state
   is **unknown** — the operation may or may not have been transitioned.
-- **Reports cannot claim success after storage failure.** Any
-  operation-level storage transition failure increments `storageErrors`,
-  which forces `isSuccess == false`.
+- **Reports cannot claim success after storage failure.** A Phase 3.1
+  `markSucceeded` failure sets `cycleError`; from Phase 3.2, any
+  operation-level storage transition failure increments
+  `storageErrors`. Either condition forces `isSuccess == false`.
 - **`inFlight` is recoverable on `start()` only.** Recovery does not run
   during sync cycles, preventing interference with other engine instances.
   Recovery itself is not guaranteed atomic — a failed recovery may leave
@@ -2589,6 +2594,12 @@ Phase 3.2 together with failure handling.
 - Cycle completing before completer awaited — report still delivered
 - Basic sync cycle with mock adapters (fetch → claim → push →
   `markSucceeded`)
+- **Phase 3.1 `markSucceeded` failure:** deterministic test where
+  `markSucceeded` throws; verify the current chunk settles, the cycle
+  ends with `cycleError`, `succeeded == 0`, `storageErrors == 0`,
+  and persisted state is treated as unknown
+- **Phase 3.1 fetch-time semantics:** use a controlled clock that advances
+  between batch fetches; verify each fetch receives its own current time
 - `SyncResult.operationId` validated before `markSucceeded`
 - **Phase 3.1 interim mismatch behavior:** mismatched
   `result.operationId` → `markSucceeded` never called; cycle aborts
