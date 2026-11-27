@@ -5,11 +5,12 @@
 
 The **Core** package of the Local Remote Synchronization ecosystem.
 
-This package contains **only** framework-agnostic abstractions:
+This package contains **only** framework-agnostic abstractions and the
+push-only sync engine:
 
 - Contracts (interfaces) that adapter packages implement.
 - Typed models shared across the ecosystem.
-- Engine, queue, retry, and conflict-resolution skeletons.
+- The `SyncEngine` orchestration foundation (Phase 3.1 scope — see below).
 
 It has **zero** dependency on sqflite, Drift, Hive, Firebase, Supabase, REST clients,
 GraphQL clients, or any connectivity library. All integrations depend on this
@@ -21,18 +22,16 @@ package, never the other way around.
 
 ```
 lib/src/
-├── core/           Shared base types and internal utilities
-├── contracts/      Abstract interfaces: LocalStorageAdapter, RemoteSyncAdapter,
-│                   ConnectivityProvider, ConflictResolver, RetryPolicy
-├── models/         SyncOperation, LocalMutation, SyncResult, SyncStatus,
-│                   SyncConfiguration, SyncError
-├── enums/          SyncOperationType, SyncResultStatus, ConflictStrategy, …
-├── exceptions/     SyncException hierarchy
-├── engine/         SyncEngine and SyncProcessor skeletons (not yet implemented)
-├── queue/          SyncQueue abstraction (durable, FIFO, survives restarts)
-├── scheduler/      SyncScheduler skeleton
-├── retry/          RetryPolicy abstraction
-└── conflict/       ConflictResolver abstraction
+├── contracts/      LocalStorageAdapter, RemoteSyncAdapter,
+│                   ConnectivityProvider, OutboxWriter
+├── models/         SyncOperation, LocalMutation, SyncResult
+│                   (SyncSuccess / SyncFailure / SyncConflict), SyncError
+├── enums/          SyncOperationType, SyncOperationStatus, SyncErrorCode
+├── engine/         SyncEngine, SyncEngineConfig, SyncCycleReport
+│                   (Phase 3.1 foundation — see below)
+├── utils/          Internal helpers (deep immutability)
+└── core/, queue/, scheduler/, retry/, conflict/, exceptions/
+                   Reserved for later phases — currently empty
 ```
 
 ---
@@ -43,10 +42,10 @@ lib/src/
 
 | Module | Status |
 |---|---|
-| Contracts | 🚧 Scaffolded |
-| Models | 🚧 Scaffolded |
-| Enums | 🚧 Scaffolded |
-| Exceptions | 🚧 Scaffolded |
+| Contracts | ✅ Implemented |
+| Models | ✅ Implemented |
+| Enums | ✅ Implemented |
+| Exceptions | 🗓 Planned |
 | Engine | 🚧 Phase 3.1 foundation |
 | Queue | 🗓 Planned |
 | Scheduler | 🗓 Planned |

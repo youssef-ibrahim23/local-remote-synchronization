@@ -208,12 +208,29 @@ final class FakeRemoteSyncAdapter implements RemoteSyncAdapter {
 final class FakeConnectivityProvider implements ConnectivityProvider {
   FakeConnectivityProvider({bool isConnected = true, List<String>? events})
       : _isConnected = isConnected,
-        _events = events;
+        _events = events {
+    _controller = StreamController<bool>.broadcast(
+      onListen: () => listenCount++,
+      onCancel: () => cancelCount++,
+    );
+  }
 
   /// Optional shared event log for ordering assertions.
   final List<String>? _events;
 
-  final StreamController<bool> _controller = StreamController<bool>.broadcast();
+  /// Number of active stream subscriptions.
+  int listenCount = 0;
+
+  /// Number of cancelled stream subscriptions.
+  int cancelCount = 0;
+
+  /// When set, the `onConnectivityChanged` getter throws it.
+  Error? subscribeError;
+
+  /// When set, the `isConnected` getter throws it.
+  Error? sampleError;
+
+  late final StreamController<bool> _controller;
 
   bool _isConnected;
 
@@ -223,6 +240,10 @@ final class FakeConnectivityProvider implements ConnectivityProvider {
   @override
   Future<bool> get isConnected {
     _events?.add('isConnectedSample');
+    final error = sampleError;
+    if (error != null) {
+      throw error;
+    }
     final gate = isConnectedGate;
     if (gate != null) {
       return gate.future;
@@ -233,6 +254,10 @@ final class FakeConnectivityProvider implements ConnectivityProvider {
   @override
   Stream<bool> get onConnectivityChanged {
     _events?.add('connectivitySubscribe');
+    final error = subscribeError;
+    if (error != null) {
+      throw error;
+    }
     return _controller.stream;
   }
 

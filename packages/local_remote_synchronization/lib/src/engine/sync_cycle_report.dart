@@ -1,6 +1,4 @@
-import 'package:meta/meta.dart';
-
-import '../models/sync_error.dart';
+part of 'sync_engine.dart';
 
 /// Immutable summary of a single sync cycle.
 ///
@@ -16,10 +14,9 @@ import '../models/sync_error.dart';
 final class SyncCycleReport {
   /// Creates a [SyncCycleReport].
   ///
-  /// Intended for `SyncEngine` internal use only — applications should
-  /// consume reports via `SyncEngine.reports` or `SyncEngine.syncNow`.
-  @internal
-  const SyncCycleReport({
+  /// Internal to the sync engine — applications should consume reports
+  /// via `SyncEngine.reports` or `SyncEngine.syncNow`.
+  const SyncCycleReport._({
     required this.startedAt,
     required this.completedAt,
     required this.fetched,

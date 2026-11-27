@@ -139,6 +139,38 @@ void main() {
       expect(sampleIndex, isNonNegative);
       expect(subscribeIndex, lessThan(sampleIndex));
     });
+
+    test('connectivity subscription failure cleans up and retries', () async {
+      connectivity.subscribeError = StateError('subscribe failed');
+      await expectLater(engine.start(), throwsStateError);
+      expect(engine.isRunning, isFalse);
+      // No subscription was ever established.
+      expect(connectivity.listenCount, 0);
+      expect(connectivity.cancelCount, 0);
+
+      connectivity.subscribeError = null;
+      await engine.start();
+      expect(engine.isRunning, isTrue);
+      expect(connectivity.listenCount, 1);
+      expect(connectivity.cancelCount, 0);
+    });
+
+    test('connectivity sampling failure cancels subscription and retries',
+        () async {
+      connectivity.sampleError = StateError('sample failed');
+      await expectLater(engine.start(), throwsStateError);
+      expect(engine.isRunning, isFalse);
+      // The partially initialized subscription was cancelled.
+      expect(connectivity.listenCount, 1);
+      expect(connectivity.cancelCount, 1);
+
+      connectivity.sampleError = null;
+      await engine.start();
+      expect(engine.isRunning, isTrue);
+      // Retry created exactly one new subscription — no duplicates.
+      expect(connectivity.listenCount, 2);
+      expect(connectivity.cancelCount, 1);
+    });
   });
 
   group('syncNow guards', () {
@@ -195,6 +227,49 @@ void main() {
       expect(disposeCompleted, isTrue);
       expect(report.succeeded, 1);
       expect(engine.isRunning, isFalse);
+    });
+
+    test('dispose while an auto-triggered cycle is pending', () async {
+      // Default config: syncOnStart = true, device online.
+      await engine.dispose();
+      await connectivity.close();
+      engine = buildEngine();
+      storage.operations.add(makeOperation('op-1'));
+      remote.gates['op-1'] = Completer<SyncResult>();
+
+      final emitted = <SyncCycleReport>[];
+      final reportsDone = Completer<void>();
+      final sub = engine.reports.listen(
+        emitted.add,
+        onDone: reportsDone.complete,
+      );
+
+      await engine.start();
+      // The auto-trigger reserved a cycle; its push is gated.
+      await waitFor(() => remote.pushCalls == 1);
+
+      final disposeFuture = engine.dispose();
+      // Disposal is pending on the active auto-triggered cycle.
+      remote.gates['op-1']!.complete(SyncSuccess(operationId: 'op-1'));
+      await disposeFuture;
+      await reportsDone.future;
+      await sub.cancel();
+
+      // Exactly one report was emitted, before the stream closed.
+      expect(emitted.length, 1);
+      expect(emitted.single.succeeded, 1);
+
+      // No new cycle can start after disposal — connectivity events are
+      // ignored and syncNow throws.
+      connectivity.emit(false);
+      connectivity.emit(true);
+      for (var i = 0; i < 20; i++) {
+        await Future<void>.delayed(Duration.zero);
+      }
+      expect(storage.fetchCalls, 1);
+      expect(remote.pushCalls, 1);
+      expect(() => engine.syncNow(), throwsStateError);
+      expect(emitted.length, 1);
     });
 
     test('sequential offline syncNow calls produce distinct reports', () async {

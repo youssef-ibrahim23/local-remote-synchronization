@@ -1,6 +1,8 @@
 import 'dart:async';
 import 'dart:math' as math;
 
+import 'package:meta/meta.dart';
+
 import '../contracts/connectivity_provider.dart';
 import '../contracts/local_storage_adapter.dart';
 import '../contracts/remote_sync_adapter.dart';
@@ -8,8 +10,9 @@ import '../enums/sync_error_code.dart';
 import '../models/sync_error.dart';
 import '../models/sync_operation.dart';
 import '../models/sync_result.dart';
-import 'sync_cycle_report.dart';
 import 'sync_engine_config.dart';
+
+part 'sync_cycle_report.dart';
 
 /// Push-only synchronization engine that orchestrates the durable
 /// outbox.
@@ -500,7 +503,7 @@ final class _CycleAccumulator {
   SyncError? cycleError;
   bool skippedOffline = false;
 
-  SyncCycleReport build(DateTime completedAt) => SyncCycleReport(
+  SyncCycleReport build(DateTime completedAt) => SyncCycleReport._(
         startedAt: startedAt,
         completedAt: completedAt,
         fetched: fetched,
