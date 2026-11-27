@@ -1,6 +1,6 @@
 # Phase 3 — Sync Engine Architecture
 
-> **Status:** Design proposal — revised after third architecture review.
+> **Status:** Design proposal — revised after fourth architecture review.
 >
 > **Scope:** Push-only synchronization orchestration. No pull, no conflict
 > resolution strategies, no background scheduling, no Flutter lifecycle.
@@ -77,8 +77,9 @@ The central orchestrator. Responsibilities:
 - Trigger sync cycles on connectivity restoration (configurable).
 - Execute manual sync cycles via `syncNow()`.
 - Prevent overlapping sync cycles within the engine instance via a
-  single-flight reservation assigned before the first asynchronous gap,
-  with guaranteed cleanup on every exit path.
+  synchronous reservation token (`_CycleSlot`) assigned before the first
+  asynchronous gap, with guaranteed cleanup of only its own reservation
+  on every exit path.
 - Fetch eligible operations, push them through `RemoteSyncAdapter`, and
   persist outcomes through `LocalStorageAdapter`.
 - Validate `SyncResult.operationId` against the pushed operation before
@@ -89,12 +90,15 @@ The central orchestrator. Responsibilities:
   outcomes across the whole cycle.
 - Use a fixed eligibility cutoff per cycle so that an operation is never
   attempted more than once within the same cycle.
+- Accumulate cycle statistics in an internal mutable accumulator and
+  construct exactly one immutable `SyncCycleReport` per cycle.
 - Emit conflict events **after** the durable `deadLetter` transition
   succeeds, using a pre-transition snapshot of the operation.
-- Emit sync cycle reports for observability, including cycle-level errors.
-- On `dispose()`, set a disposal-requested state immediately, then await
-  startup cleanup, cancel subscriptions, await the active cycle, and
-  close streams.
+- Emit sync cycle reports for observability, including cycle-level errors
+  and operation-level storage transition failures.
+- On `dispose()`, set a disposal-requested state synchronously before any
+  `await`, then await startup cleanup, cancel subscriptions, await the
+  active cycle reservation, and close streams.
 
 ### `SyncEngineConfig`
 
@@ -138,10 +142,11 @@ Concrete `RetryPolicy` implementation providing:
 ### `SyncCycleReport`
 
 Immutable value object summarizing a single sync cycle. Returned by
-`syncNow()` and emitted on the `reports` stream. Contains counts of
-fetched/succeeded/failed/conflicted/dead-lettered operations, cycle-level
-error state, and timing information. `completedAt` is non-null for all
-emitted reports.
+`syncNow()` and emitted on the `reports` stream. Exactly one instance is
+constructed per cycle, at cycle completion, from an internal mutable
+`_CycleAccumulator`. `completedAt` is always populated. Contains counts of
+fetched/succeeded/failed/conflicted/dead-lettered/storage-error
+operations, cycle-level error state, and timing information.
 
 Counter relationships:
 - `fetched` counts the total number of operations returned by
@@ -149,14 +154,24 @@ Counter relationships:
   **before** any filtering (attempted-operation dedup, per-entity
   selection). It represents raw adapter results, not unique operations
   selected for pushing.
+- `succeeded`, `failed`, `conflicted`, and `deadLettered` are incremented
+  **only after** the corresponding storage transition
+  (`markSucceeded`/`markFailed`/`markDeadLetter`) completes without
+  throwing.
 - `conflicted` counts operations whose remote result was `SyncConflict`.
 - `deadLettered` counts **every** operation transitioned to `deadLetter`,
   including conflicts, non-retryable failures, max-attempt exhaustion,
-  and protocol violations.
+  and protocol violations. It is incremented only when `markDeadLetter`
+  completes without throwing.
 - Therefore `conflicted` is a **subset** of `deadLettered`.
-- A failed storage transition (e.g., `markSucceeded` throws) means the
-  persisted state is **unknown** — the operation may or may not have been
-  transitioned. No counter is incremented in this case.
+- `storageErrors` counts operation-level storage transition failures
+  (`markSucceeded`, `markFailed`, or `markDeadLetter` throwing **after**
+  a push result was received). Each represents a persisted state that is
+  **unknown** — the operation may or may not have been transitioned.
+- Cycle-level storage failures (`fetchEligibleOperations` or
+  `markInFlight` throwing) are represented by `cycleError`, not
+  `storageErrors`, because they abort the cycle rather than affecting a
+  single operation's post-push transition.
 
 ### `SyncConflictEvent`
 
@@ -205,13 +220,13 @@ final class SyncEngine {
   });
 
   /// Whether [start] has completed successfully and [dispose] has not
-  /// been called.
+  /// been requested.
   bool get isRunning;
 
   /// Stream of [SyncCycleReport]s emitted after each completed cycle.
-  /// Reports are emitted only after the cycle has fully finished, including
-  /// all storage transitions. Useful for observability, logging, and UI
-  /// status indicators.
+  /// Exactly one immutable report is constructed per cycle and emitted
+  /// after all storage transitions have settled. Useful for observability,
+  /// logging, and UI status indicators.
   Stream<SyncCycleReport> get reports;
 
   /// Stream of [SyncConflictEvent]s emitted after a conflict has been
@@ -227,12 +242,12 @@ final class SyncEngine {
   /// or `failed`), not `deadLetter`. The adapter does not mutate the
   /// in-memory `SyncOperation` instance.
   ///
-  /// The operation remains `deadLetter` in the outbox after notification.
-  /// Later operations for the same entity remain blocked. The Core
-  /// contract does **not** provide a supported conflict-resolution or
-  /// discard workflow. The application may inspect the dead-lettered
-  /// operation and remote state manually, but no automated resolution is
-  /// guaranteed.
+  /// The operation remains `deadLetter` in the outbox after notification
+  /// (assuming `markDeadLetter` succeeded). Later operations for the same
+  /// entity remain blocked. The Core contract does **not** provide a
+  /// supported conflict-resolution or discard workflow. The application
+  /// may inspect the dead-lettered operation and remote state manually,
+  /// but no automated resolution is guaranteed.
   Stream<SyncConflictEvent> get conflicts;
 
   /// Starts the engine.
@@ -240,8 +255,8 @@ final class SyncEngine {
   /// 1. Recovers stale `inFlight` operations via
   ///    [LocalStorageAdapter.recoverInFlightOperations] **once** per
   ///    successful engine startup lifecycle.
-  /// 2. Initializes connectivity monitoring: sets `_initializing = true`,
-  ///    creates the event buffer, subscribes to
+  /// 2. Initializes connectivity monitoring: creates the event buffer,
+  ///    sets `_initializing = true`, subscribes to
   ///    [ConnectivityProvider.onConnectivityChanged], then samples
   ///    [ConnectivityProvider.isConnected]. Events received during
   ///    sampling are buffered and reconciled with the sample.
@@ -261,27 +276,38 @@ final class SyncEngine {
   /// retry from the beginning. No sync cycle can begin before startup
   /// completes successfully.
   ///
-  /// If [dispose] is called while [start] is in progress, a
-  /// disposal-requested state is set immediately. Startup checks this
-  /// state after asynchronous gaps and will not schedule new work or
-  /// create subscriptions after disposal is requested.
+  /// If [recoverInFlightOperations] throws, the persisted state may be
+  /// **partially changed** — the Core contract does not guarantee atomic
+  /// recovery. A subsequent [start] retries recovery; adapters are
+  /// expected to make recovery idempotent, but this is not contractually
+  /// guaranteed (see Section 10).
   ///
-  /// Throws [StateError] if called after [dispose] has completed.
+  /// If [dispose] is called while [start] is in progress, a
+  /// disposal-requested state is set synchronously before any `await`.
+  /// Startup checks this state after asynchronous gaps and will not
+  /// schedule new work or create subscriptions after disposal is
+  /// requested.
+  ///
+  /// Throws [StateError] if called after [dispose] has been requested.
   Future<void> start();
 
   /// Manually triggers a sync cycle.
   ///
   /// Requires [start] to have completed successfully. Throws [StateError]
-  /// if called before [start] or after [dispose].
+  /// if called before [start] or after [dispose] has been requested.
   ///
   /// If a cycle is already in progress, returns the in-flight cycle's
   /// [SyncCycleReport] future (deduplication — no overlapping cycles).
-  /// The cycle is reserved synchronously before the first asynchronous
-  /// gap, so concurrent callers cannot both start separate cycles.
   ///
-  /// Every exit path from a cycle — including skipped-offline cycles —
-  /// clears `_activeCycle` in a single `finally` block, preventing an
-  /// older cycle's cleanup from clearing a newer cycle's reservation.
+  /// **Reservation mechanism:** a private `_CycleSlot` object is created
+  /// and assigned to `_activeCycleSlot` synchronously, before any
+  /// `await`. The slot holds a `Completer<SyncCycleReport>`. The cycle
+  /// executor completes the completer with the immutable report when
+  /// finished, and clears `_activeCycleSlot` in a `finally` block only if
+  /// `identical(_activeCycleSlot, slot)` — so a cycle always cleans up
+  /// only its own reservation, including skipped-offline early returns.
+  /// Concurrent callers share `slot.completer.future`; sequential callers
+  /// (after the previous slot was cleared) each get their own cycle.
   ///
   /// If [SyncEngineConfig.syncWhenOffline] is `false` (default) and the
   /// device is offline, returns a report with `skippedOffline: true`
@@ -290,18 +316,22 @@ final class SyncEngine {
 
   /// Releases all resources.
   ///
-  /// 1. Sets a disposal-requested state (`_disposeRequested = true`)
-  ///    **immediately**, before any `await`. This prevents startup from
-  ///    scheduling new work and prevents new sync cycles from starting.
-  /// 2. If startup is in progress, awaits its cleanup.
+  /// 1. Sets `_disposeRequested = true` **synchronously, before any
+  ///    `await`**. This immediately prevents `start()` and `syncNow()`
+  ///    from proceeding (they throw `StateError`), prevents pending
+  ///    connectivity events and auto-triggers from starting new work,
+  ///    and causes an in-progress startup to abort after its current
+  ///    asynchronous gap.
+  /// 2. If startup is in progress, awaits its settlement.
   /// 3. Cancels the connectivity subscription.
-  /// 4. Waits for the active sync cycle to complete (if any).
-  ///    Does **not** impose a timeout — remote calls are not cancellable,
-  ///    so shutdown time is bounded only by the remote adapter's own
-  ///    timeouts.
-  /// 5. Closes internal stream controllers **after** startup, the active
-  ///    cycle, and any pending auto-triggers have completed and no
-  ///    further events can be emitted.
+  /// 4. If a cycle reservation (`_activeCycleSlot`) exists, awaits its
+  ///    completer — the active cycle runs to completion (in-flight pushes
+  ///    finish, storage transitions settle, the report is emitted).
+  ///    Does **not** impose a timeout — remote calls are not cancellable.
+  /// 5. Closes internal stream controllers. Because `_disposeRequested`
+  ///    was set before any `await`, no new cycle can be reserved after
+  ///    step 1, and the only possible emitter (the awaited active cycle)
+  ///    has completed — so no event can be emitted after close.
   ///
   /// Concurrent calls to [dispose] share one disposal Future so every
   /// caller awaits completed cleanup.
@@ -310,8 +340,9 @@ final class SyncEngine {
   /// [ConnectivityProvider] — the application owns their lifecycles.
   ///
   /// Operations currently `inFlight` remain `inFlight` (or in an unknown
-  /// state if a storage transition failed during disposal) and will be
-  /// recovered to `pending` on the next [start] call.
+  /// state if a storage transition failed during the cycle) and will be
+  /// recovered to `pending` on the next [start] call — subject to the
+  /// atomicity caveat described for [start].
   Future<void> dispose();
 }
 ```
@@ -487,6 +518,11 @@ final class ExponentialBackoffRetryPolicy implements RetryPolicy {
 
 ```dart
 /// Immutable summary of a single sync cycle.
+///
+/// Exactly one instance is constructed per cycle, at cycle completion,
+/// from an internal mutable accumulator. It is never mutated after
+/// construction and is the same instance returned by [SyncEngine.syncNow]
+/// and emitted on [SyncEngine.reports].
 final class SyncCycleReport {
   const SyncCycleReport._({
     required this.startedAt,
@@ -496,6 +532,7 @@ final class SyncCycleReport {
     required this.failed,
     required this.conflicted,
     required this.deadLettered,
+    required this.storageErrors,
     required this.cycleError,
     required this.skippedOffline,
   });
@@ -503,8 +540,8 @@ final class SyncCycleReport {
   /// When the cycle started.
   final DateTime startedAt;
 
-  /// When the cycle completed. Non-null for all emitted reports — a report
-  /// is only created after the cycle has fully finished.
+  /// When the cycle completed. Always populated — the report is only
+  /// constructed after the cycle has fully finished.
   final DateTime completedAt;
 
   /// Number of operations returned by `fetchEligibleOperations` across
@@ -514,17 +551,18 @@ final class SyncCycleReport {
   final int fetched;
 
   /// Number of operations successfully pushed and confirmed removed
-  /// from the outbox. Only incremented when `markSucceeded` completes
-  /// without throwing. If `markSucceeded` throws, the persisted state
-  /// is unknown and no counter is incremented.
+  /// from the outbox. Incremented **only** when `markSucceeded` completes
+  /// without throwing. If `markSucceeded` throws, the persisted state is
+  /// unknown, [storageErrors] is incremented, and this counter is not.
   final int succeeded;
 
   /// Number of operations that failed and were scheduled for retry.
-  /// Only incremented when `markFailed` completes without throwing.
+  /// Incremented **only** when `markFailed` completes without throwing.
+  /// If `markFailed` throws, [storageErrors] is incremented instead.
   final int failed;
 
   /// Number of operations whose remote result was [SyncConflict].
-  /// This is a subset of [deadLettered]. Only incremented when
+  /// This is a subset of [deadLettered]. Incremented **only** when
   /// `markDeadLetter` completes without throwing.
   final int conflicted;
 
@@ -533,16 +571,28 @@ final class SyncCycleReport {
   /// - Non-retryable failures
   /// - Max-attempt exhaustion
   /// - Protocol violations (operationId mismatch)
-  /// Only incremented when `markDeadLetter` completes without throwing.
+  /// Incremented **only** when `markDeadLetter` completes without
+  /// throwing. If `markDeadLetter` throws, [storageErrors] is
+  /// incremented instead.
   final int deadLettered;
+
+  /// Number of operation-level storage transition failures: a push
+  /// result was received (`SyncSuccess`, `SyncFailure`, or
+  /// `SyncConflict`) but the corresponding `markSucceeded`, `markFailed`,
+  /// or `markDeadLetter` call threw. Each failure means the persisted
+  /// state of that operation is **unknown** — it may or may not have
+  /// been transitioned.
+  ///
+  /// Cycle-level storage failures (`fetchEligibleOperations` or
+  /// `markInFlight` throwing) are NOT counted here — they set
+  /// [cycleError] and abort the cycle instead.
+  final int storageErrors;
 
   /// Cycle-level error that prevented the cycle from completing normally
   /// (e.g., `fetchEligibleOperations` threw, `markInFlight` failed).
   /// Null if the cycle completed without cycle-level errors. Individual
-  /// operation failures are counted in [failed] and [deadLettered], not
-  /// here. A storage transition failure at the operation level (e.g.,
-  /// `markSucceeded` throws) does NOT set `cycleError` — it means the
-  /// persisted state for that operation is unknown.
+  /// operation failures are counted in [failed], [deadLettered], and
+  /// [storageErrors], not here.
   final SyncError? cycleError;
 
   /// Whether the cycle was skipped because the device is offline.
@@ -552,34 +602,51 @@ final class SyncCycleReport {
   /// [completedAt] is always non-null.
   Duration get duration => completedAt.difference(startedAt);
 
-  /// Whether the cycle completed without errors.
+  /// Whether the cycle completed **without any failure**.
   ///
-  /// Returns `false` if:
+  /// Returns `false` if any of the following occurred:
   /// - [failed] > 0 (operations scheduled for retry)
   /// - [conflicted] > 0 (operations parked as deadLetter due to conflict)
   /// - [deadLettered] > 0 (operations exhausted retries, non-retryable,
   ///   or protocol violations)
+  /// - [storageErrors] > 0 (operation-level storage transition failed;
+  ///   persisted state unknown)
   /// - [cycleError] != null (cycle-level failure)
   ///
-  /// Returns `true` if:
-  /// - [skippedOffline] is `true` — this means "no failure occurred,"
-  ///   but does **not** mean any operation was synchronized. A skipped
-  ///   cycle is a no-op, not a successful sync.
-  /// - All operations succeeded and no cycle-level error occurred
+  /// Returns `true` only when none of the above occurred. Note:
+  /// - A `skippedOffline` report returns `true` because **no failure
+  ///   occurred** — but this does **NOT** mean any operation was
+  ///   synchronized. A skipped cycle is a no-op.
+  /// - `isSuccess == true` is **not proof that synchronization
+  ///   occurred**. To determine whether operations were actually
+  ///   synchronized, inspect [succeeded], [fetched], and
+  ///   [skippedOffline]. A cycle that fetched zero eligible operations
+  ///   also returns `isSuccess == true`.
   bool get isSuccess =>
       cycleError == null &&
       failed == 0 &&
       conflicted == 0 &&
-      deadLettered == 0;
+      deadLettered == 0 &&
+      storageErrors == 0;
 
   @override
   String toString() =>
       'SyncCycleReport(fetched: $fetched, succeeded: $succeeded, '
       'failed: $failed, conflicted: $conflicted, '
-      'deadLettered: $deadLettered, skippedOffline: $skippedOffline, '
-      'cycleError: $cycleError, duration: $duration)';
+      'deadLettered: $deadLettered, storageErrors: $storageErrors, '
+      'skippedOffline: $skippedOffline, cycleError: $cycleError, '
+      'duration: $duration)';
 }
 ```
+
+`isSuccess` semantics — three distinct concepts that must not be
+conflated:
+
+| Concept | How to determine |
+|---------|------------------|
+| No errors occurred | `report.isSuccess` |
+| Operations were actually synchronized | `report.succeeded > 0` (and `report.skippedOffline == false`) |
+| Cycle was skipped (offline) | `report.skippedOffline == true` — `isSuccess` may still be `true`, meaning only "no failure occurred" |
 
 ### `SyncConflictEvent`
 
@@ -590,7 +657,8 @@ final class SyncCycleReport {
 /// The event is emitted only after [LocalStorageAdapter.markDeadLetter]
 /// has completed without throwing. If the storage transition throws, the
 /// persisted state is **unknown** (the operation may or may not have been
-/// dead-lettered), no event is emitted, and the error is logged.
+/// dead-lettered), [SyncCycleReport.storageErrors] is incremented, no
+/// event is emitted, and the error is logged.
 ///
 /// [SyncConflictEvent.operation] is a **pre-transition snapshot** of the
 /// `SyncOperation` as it was fetched from the outbox. Its `status` field
@@ -609,7 +677,7 @@ final class SyncCycleReport {
 /// entity remain blocked. The Core contract does **not** provide a
 /// supported conflict-resolution or discard workflow.
 /// [LocalStorageAdapter.markSucceeded] is semantically incorrect as a
-/// conflict-resolution API (it means "remote accepted, not "discard
+/// conflict-resolution API (it means "remote accepted", not "discard
 /// conflict") and must not be used as one.
 final class SyncConflictEvent {
   const SyncConflictEvent({
@@ -625,6 +693,45 @@ final class SyncConflictEvent {
   /// The conflict result from the remote adapter, including
   /// [SyncConflict.remoteSnapshot].
   final SyncConflict conflict;
+}
+```
+
+### Internal `_CycleAccumulator` (not public API)
+
+The engine uses a private mutable accumulator during cycle execution so
+that `SyncCycleReport` can remain immutable:
+
+```dart
+/// Private mutable accumulator — never exposed publicly.
+final class _CycleAccumulator {
+  _CycleAccumulator({required this.startedAt, required this.eligibilityCutoff});
+
+  final DateTime startedAt;
+  final DateTime eligibilityCutoff;
+  int fetched = 0;
+  int succeeded = 0;
+  int failed = 0;
+  int conflicted = 0;
+  int deadLettered = 0;
+  int storageErrors = 0;
+  SyncError? cycleError;
+  bool skippedOffline = false;
+
+  /// Constructs the single immutable [SyncCycleReport] for this cycle.
+  /// Called exactly once, at cycle completion, on every exit path
+  /// (normal, skipped-offline, cycle error, unexpected exception).
+  SyncCycleReport build(DateTime completedAt) => SyncCycleReport._(
+        startedAt: startedAt,
+        completedAt: completedAt,
+        fetched: fetched,
+        succeeded: succeeded,
+        failed: failed,
+        conflicted: conflicted,
+        deadLettered: deadLettered,
+        storageErrors: storageErrors,
+        cycleError: cycleError,
+        skippedOffline: skippedOffline,
+      );
 }
 ```
 
@@ -645,6 +752,11 @@ final class SyncConflictEvent {
 
 ## 4. Sync Cycle Sequence
 
+This section is the **single authoritative description** of engine
+startup, cycle reservation, cycle execution, and result handling.
+Section 9 references this section and covers only disposal, lifecycle
+edge cases, and connectivity behavior.
+
 ### Startup (`start()`)
 
 ```
@@ -661,6 +773,8 @@ _performStartup():
   │     ├─ await localStorage.recoverInFlightOperations()
   │     │   └─ if _disposeRequested → cleanup, return
   │     │   └─ if throws → cleanup, rethrow
+  │     │      NOTE: persisted state may be PARTIALLY changed — the
+  │     │      Core contract does not guarantee atomic recovery.
   │     │
   │     ├─ // Step 2: Initialize connectivity monitoring
   │     ├─ _pendingConnectivityEvents = <bool>[]  ← buffer FIRST
@@ -723,7 +837,12 @@ _performStartup():
 `_started` remains `false`, partial resources (connectivity subscription,
 buffers) are cleaned up, and the exception propagates to the caller. A
 subsequent `start()` call will create a new `_startupFuture` and retry
-from the beginning. No sync cycle can begin before startup completes
+from the beginning — including re-running `recoverInFlightOperations()`.
+Adapters are expected to make recovery idempotent, but the Core contract
+does not guarantee atomic recovery: if recovery partially succeeded
+before throwing, some operations may already be `pending` while others
+remain `inFlight`. The next recovery attempt will reset the remaining
+`inFlight` operations. No sync cycle can begin before startup completes
 because `_started` is only set to `true` after all startup steps succeed.
 
 **`syncOnStart` ordering:** `_started = true` is set **before**
@@ -745,171 +864,267 @@ overwriting a newer event.
 asynchronous gap. If disposal is requested, startup cleans up and
 returns without setting `_started` or scheduling auto-sync.
 
-### Sync cycle (`syncNow()` or auto-trigger)
+### Cycle reservation (`syncNow()`)
 
 ```
 syncNow()
   ├─ if _disposeRequested → throw StateError("SyncEngine is disposed")
   ├─ if !_started → throw StateError("SyncEngine.start() must complete first")
-  ├─ if _activeCycle != null → return _activeCycle  (share active cycle)
-  ├─ // Reserve cycle synchronously — no async gap before assignment
-  ├─ _activeCycle = _runCycle()
-  └─ return _activeCycle
-
-_runCycle():
-  ├─ // Centralized cleanup: single finally block clears _activeCycle
-  ├─ try {
-  │     report = SyncCycleReport(startedAt: now, ...)
-  │     eligibilityCutoff = now  ← fixed cutoff for this cycle
-  │     attemptedOperationIds = <String>{}
-  │     entityBlocked = <String>{}  ← entities blocked for rest of cycle
-  │     entityKey(entityType, entityId) = jsonEncode([entityType, entityId])
+  ├─ existing = _activeCycleSlot
+  ├─ if existing != null → return existing.completer.future  (share cycle)
   │
-  │     if (!config.syncWhenOffline && !_isConnected) {
-  │       report.skippedOffline = true
-  │       report.completedAt = now
-  │       reports.add(report)
-  │       return report
+  ├─ // Synchronous reservation — no async gap before assignment
+  ├─ slot = _CycleSlot()               // holds Completer<SyncCycleReport>
+  ├─ _activeCycleSlot = slot           // reservation token
+  ├─ unawaited(_executeCycle(slot))    // never throws; completes completer
+  └─ return slot.completer.future
+```
+
+`_CycleSlot` is a private final class:
+
+```dart
+final class _CycleSlot {
+  final Completer<SyncCycleReport> completer = Completer<SyncCycleReport>();
+}
+```
+
+**Why a reservation token instead of comparing Futures:** The previous
+design compared `_activeCycle` against the Future returned by `_runCycle()`
+inside its own `finally` block, which relied on undefined timing (whether
+the Future's `finally` runs before or after the assignment). The slot
+object is created and assigned **synchronously** in `syncNow()` before any
+`await`, so its identity is known to `_executeCycle` from the start. Every
+exit path — normal completion, skipped-offline, cycle error, unexpected
+exception — funnels through a single `finally` that clears
+`_activeCycleSlot` only when `identical(_activeCycleSlot, slot)`.
+
+**Guarantees:**
+- **Reservation before async gap:** `_activeCycleSlot = slot` executes
+  synchronously; Dart's single-threaded event loop ensures no other
+  caller can interleave between the null check and the assignment.
+- **Every exit path cleans up:** the `finally` in `_executeCycle` runs on
+  all paths, including skipped-offline early returns.
+- **Only own reservation cleared:** `identical(_activeCycleSlot, slot)`
+  prevents a stale cycle from clearing a newer reservation.
+- **Offline early returns create separate cycles:** a skipped-offline
+  cycle completes its completer and clears its slot in `finally` before
+  the next `syncNow()` call's synchronous body runs, so two sequential
+  offline `syncNow()` calls each get their own cycle and report.
+- **Concurrent calls share one cycle:** the second caller sees
+  `_activeCycleSlot != null` and returns `slot.completer.future`.
+- **No reliance on Future timing:** the completer exists before the cycle
+  starts; there is no window where the cycle could complete before its
+  "Future" is assigned.
+
+### Cycle execution (`_executeCycle(slot)`)
+
+```
+_executeCycle(slot):
+  ├─ accumulator = _CycleAccumulator(
+  │     startedAt: clock.now(),
+  │     eligibilityCutoff: clock.now(),
+  │   )
+  ├─ attemptedOperationIds = <String>{}   ← per-cycle guard
+  ├─ entityBlocked = <String>{}           ← per-cycle entity outcomes
+  │
+  ├─ try {                              ← OUTER try: guarantees cleanup
+  │     try {                          ← INNER try: captures cycle errors
+  │       if (!config.syncWhenOffline && !_isConnected) {
+  │         accumulator.skippedOffline = true
+  │       } else {
+  │       loop:
+  │         a. operations = await localStorage.fetchEligibleOperations(
+  │              now: accumulator.eligibilityCutoff,
+  │              limit: config.batchSize,
+  │              preservePerEntityOrder: true,
+  │            )
+  │            └─ if throws → accumulator.cycleError = SyncError(storage,...), break loop
+  │
+  │         b. if operations.isEmpty → break loop
+  │
+  │         c. accumulator.fetched += operations.length  ← raw results
+  │
+  │         d. // Filter out operations already attempted this cycle
+  │            operations = operations.where(
+  │              (op) => !attemptedOperationIds.contains(op.operationId)
+  │            ).toList()
+  │            if (operations.isEmpty) → break loop
+  │
+  │         e. // Per-entity ordering guard:
+  │            // 1. Group by entity using collision-safe key
+  │            // 2. Skip entities already blocked this cycle
+  │            // 3. Sort each group by (sequenceNumber, createdAt, operationId)
+  │            // 4. Select only the earliest per entity
+  │            final byEntity = <String, List<SyncOperation>>{}
+  │            for (final op in operations) {
+  │              final key = jsonEncode([op.entityType, op.entityId])
+  │              if (entityBlocked.contains(key)) continue
+  │              byEntity.putIfAbsent(key, () => []).add(op)
+  │            }
+  │
+  │            final selectedOps = <SyncOperation>[]
+  │            for (final entry in byEntity.entries) {
+  │              final group = entry.value
+  │              group.sort((a, b) {
+  │                final seqA = a.sequenceNumber ?? 0
+  │                final seqB = b.sequenceNumber ?? 0
+  │                if (seqA != seqB) return seqA.compareTo(seqB)
+  │                final createdCompare = a.createdAt.compareTo(b.createdAt)
+  │                if (createdCompare != 0) return createdCompare
+  │                return a.operationId.compareTo(b.operationId)
+  │              })
+  │              selectedOps.add(group.first)  ← earliest per entity
+  │            }
+  │
+  │         f. for each chunk of maxConcurrency from selectedOps:
+  │            i.   // Claim ALL ops in chunk BEFORE any push
+  │                 // If ANY markInFlight fails, abort cycle — do NOT
+  │                 // push any op in this chunk
+  │                 final chunkClaims = <SyncOperation>[]
+  │                 var claimFailed = false
+  │                 for (final op in chunk) {
+  │                   try {
+  │                     await localStorage.markInFlight(op.operationId)
+  │                     chunkClaims.add(op)
+  │                     attemptedOperationIds.add(op.operationId)
+  │                   } catch (e) {
+  │                     // Storage transition failed — persisted state UNKNOWN.
+  │                     // The operation may or may not have been claimed.
+  │                     // Abort cycle; previously claimed ops in this chunk
+  │                     // remain inFlight (or unknown) and will be
+  │                     // recovered on next start.
+  │                     accumulator.cycleError = SyncError(
+  │                       code: SyncErrorCode.storage,
+  │                       message: 'markInFlight failed (state unknown): $e',
+  │                       isRetryable: true,
+  │                     )
+  │                     claimFailed = true
+  │                     break
+  │                   }
+  │                 }
+  │                 if (claimFailed) break loop  ← abort entire cycle
+  │
+  │            ii.  // All claims succeeded — now push concurrently
+  │                 await Future.wait(
+  │                   chunkClaims.map((op) => _pushAndHandle(
+  │                     op, accumulator, entityBlocked,
+  │                   )),
+  │                 )
+  │
+  │         g. if operations.length < config.batchSize → break loop
+  │       }                                   ← end else / loop
+  │     } catch (e, st) {
+  │       // Unexpected cycle-level failure
+  │       accumulator.cycleError ??= SyncError(
+  │         code: SyncErrorCode.unknown,
+  │         message: 'Unexpected cycle error: $e',
+  │         isRetryable: true,
+  │         cause: e,
+  │         stackTrace: st,
+  │       )
   │     }
   │
-  │     loop:
-  │       a. operations = await localStorage.fetchEligibleOperations(
-  │            now: eligibilityCutoff,
-  │            limit: config.batchSize,
-  │            preservePerEntityOrder: true,
-  │          )
-  │          └─ if throws → report.cycleError = SyncError(storage, ...), break
+  │     // Build the single immutable report — every exit path reaches here
+  │     final report = accumulator.build(clock.now())
   │
-  │       b. if operations.isEmpty → break
+  │     // Emit report BEFORE completing the completer. Guarded: the
+  │     // dispose-ordering invariant makes a closed controller impossible
+  │     // here, but a failure must not prevent completer completion.
+  │     try {
+  │       _reportController.add(report)
+  │     } catch (_) {
+  │       // Unreachable per dispose ordering; swallow so the completer
+  │       // below is always completed exactly once.
+  │     }
   │
-  │       c. report.fetched += operations.length  ← raw adapter results
+  │     slot.completer.complete(report)   ← exactly once, always reached
   │
-  │       d. // Filter out operations already attempted this cycle
-  │          operations = operations.where(
-  │            (op) => !attemptedOperationIds.contains(op.operationId)
-  │          ).toList()
-  │          if (operations.isEmpty) → break
-  │
-  │       e. // Per-entity ordering guard:
-  │          // 1. Group by entity using collision-safe key
-  │          // 2. Skip entities already blocked this cycle
-  │          // 3. Sort each group by (sequenceNumber, createdAt, operationId)
-  │          // 4. Select only the earliest per entity
-  │          final byEntity = <String, List<SyncOperation>>{}
-  │          for (final op in operations) {
-  │            final key = entityKey(op.entityType, op.entityId)
-  │            if (entityBlocked.contains(key)) continue
-  │            byEntity.putIfAbsent(key, () => []).add(op)
-  │          }
-  │
-  │          final selectedOps = <SyncOperation>[]
-  │          for (final entry in byEntity.entries) {
-  │            final group = entry.value
-  │            group.sort((a, b) {
-  │              final seqA = a.sequenceNumber ?? 0
-  │              final seqB = b.sequenceNumber ?? 0
-  │              if (seqA != seqB) return seqA.compareTo(seqB)
-  │              final createdCompare = a.createdAt.compareTo(b.createdAt)
-  │              if (createdCompare != 0) return createdCompare
-  │              return a.operationId.compareTo(b.operationId)
-  │            })
-  │            selectedOps.add(group.first)  ← earliest per entity
-  │          }
-  │
-  │       f. for each chunk of maxConcurrency:
-  │          i.   // Claim ALL ops in chunk BEFORE any push
-  │               // If ANY markInFlight fails, abort cycle — do NOT
-  │               // push any op in this chunk
-  │               final chunkClaims = <SyncOperation>[]
-  │               var claimFailed = false
-  │               for (final op in chunk) {
-  │                 try {
-  │                   await localStorage.markInFlight(op.operationId)
-  │                   chunkClaims.add(op)
-  │                   attemptedOperationIds.add(op.operationId)
-  │                 } catch (e) {
-  │                   // Storage transition failed — persisted state UNKNOWN.
-  │                   // The operation may or may not have been claimed.
-  │                   // Abort cycle; previously claimed ops in this chunk
-  │                   // remain inFlight and will be recovered on next start.
-  │                   report.cycleError = SyncError(
-  │                     code: SyncErrorCode.storage,
-  │                     message: 'markInFlight failed (state unknown): $e',
-  │                     isRetryable: true,
-  │                   )
-  │                   claimFailed = true
-  │                   break
-  │                 }
-  │               }
-  │               if (claimFailed) break loop  ← abort entire cycle
-  │
-  │          ii.  // All claims succeeded — now push concurrently
-  │               final results = await Future.wait(
-  │                 chunkClaims.map((op) => _pushAndHandle(op, report, entityBlocked)),
-  │               )
-  │
-  │       g. if operations.length < config.batchSize → break
-  │
-  │     report.completedAt = now
-  │     reports.add(report)
-  │     return report
-  │
-  │ } catch (e) {
-  │   report.cycleError = SyncError(unknown, ...)
-  │   report.completedAt = now
-  │   reports.add(report)
-  │   return report
-  │ } finally {
-  │   // CENTRALIZED CLEANUP — single path for ALL exits
-  │   // including skipped-offline, normal completion, and errors
-  │   if (identical(_activeCycle, thisCycleFuture)) {
-  │     _activeCycle = null
+  │   } finally {
+  │     // SINGLE cleanup path — clears only THIS cycle's reservation
+  │     if (identical(_activeCycleSlot, slot)) {
+  │       _activeCycleSlot = null
+  │     }
   │   }
-  │ }
 ```
 
-**Single-flight reservation:** `_activeCycle` is assigned synchronously
-in `syncNow()` (immediately after the null check, before any `await`).
-`_runCycle()` is called synchronously and returns a `Future` that is
-immediately assigned to `_activeCycle`. Two concurrent callers cannot
-both pass the check — the first caller assigns `_activeCycle` before
-yielding to the event loop, so the second caller sees the non-null value
-and returns the same future. No async gap exists between the check and
-the assignment. No `Completer` is needed.
+**Report construction:** `_CycleAccumulator` is mutable during execution.
+Exactly one immutable `SyncCycleReport` is built at the end via
+`accumulator.build(clock.now())`, which always populates `completedAt`.
+The same instance is emitted on `reports` and completes the slot's
+completer, so `syncNow()` awaiters and stream listeners see the identical
+object. No mutable report is ever exposed.
 
-**Cycle cleanup:** The `finally` block in `_runCycle` is the **single**
-cleanup path for all exits — normal completion, skipped-offline, cycle
-error, and unexpected exceptions. It checks `identical(_activeCycle,
-thisCycleFuture)` before clearing to prevent an older cycle's cleanup
-from clearing a newer cycle's reservation (in the unlikely event that a
-cycle's Future completes after a new cycle has been reserved — this can
-happen if the old cycle's `finally` is delayed by the event loop).
+**Ordering of emit vs complete:** The report is added to
+`_reportController` before `slot.completer.complete(report)`. Stream
+`add` is synchronous into the controller's buffer; completer listeners
+run as microtasks after `complete()`. The `finally` block clears the slot
+synchronously after `complete()` returns, before any listener resumes —
+so a caller that does `await engine.syncNow()` followed immediately by
+another `syncNow()` deterministically gets a new cycle.
 
-**Cycle completing before Future assignment:** In Dart, `_runCycle()`
-returns a `Future` synchronously. Even if the async body completes
-immediately (e.g., skipped-offline path), the `Future` is returned
-before the assignment `_activeCycle = _runCycle()` completes. The
-`finally` block runs when the async body finishes, which is always
-after the synchronous assignment. The `identical` check handles the
-edge case where the event loop schedules the `finally` after a new
-cycle has been reserved.
+**`_reportController.add` safety:** `dispose()` awaits the active slot's
+completer before closing controllers, and `_disposeRequested` prevents
+any new reservation after disposal begins. A cycle can therefore never
+emit after its controller is closed.
 
-**Sequential offline `syncNow()` calls:** Two sequential offline
-`syncNow()` calls each create a separate `_activeCycle` because the
-first call's `finally` clears `_activeCycle` before the second call
-checks it. Each call returns its own skipped-offline report. This is
-deterministic because Dart's event loop processes the first call's
-`finally` before the second call's synchronous body.
+**`_executeCycle` never throws:** Every fallible operation — all storage
+and remote calls (inner `try`/`catch`), the stream emit (guarded
+`try`/`catch`), and `Completer.complete` (cannot throw on first
+completion; `build` is a pure constructor call) — is either captured or
+non-throwing. The outer `finally` always runs. Therefore the
+`unawaited(_executeCycle(slot))` invocation in `syncNow()` can never
+produce an unhandled asynchronous error, and `slot.completer` is
+completed exactly once on every path — `syncNow()` awaiters can never
+hang.
 
-**Manual and connectivity-triggered sharing:** Both `syncNow()` and
-`_triggerAutoSync()` call the same `syncNow()` method which performs the
-single-flight check and reservation. They share the same `_activeCycle`
-future.
-
-### `_pushAndHandle(operation, report, entityBlocked)`
+### `_triggerAutoSync()`
 
 ```
-_pushAndHandle(op, report, entityBlocked):
+_triggerAutoSync()
+  ├─ if _disposeRequested || !_started → return
+  ├─ try {
+  │     await syncNow()
+  │   } catch (e) {
+  │     log warning  ← prevent unhandled async error
+  │     // Includes StateError from syncNow() if disposal was requested
+  │     // between this guard check and the syncNow() call.
+  │   }
+```
+
+**Auto-trigger/dispose race — exact guard strategy:**
+
+1. `dispose()` sets `_disposeRequested = true` **synchronously** before
+   any `await`. From that instant:
+   - `syncNow()` throws `StateError` at its first check — no new slot can
+     be reserved.
+   - `_triggerAutoSync()` returns immediately at its guard check.
+   - The connectivity listener ignores events (`if (_disposeRequested)
+     return`).
+   - An in-progress startup aborts after its current `await`.
+2. A pending auto-trigger falls into exactly one of three cases:
+   - **Has not yet called `syncNow()`:** hits the `_disposeRequested`
+     guard in `_triggerAutoSync` or in `syncNow` → returns/throws →
+     caught and logged. No work starts.
+   - **Already inside `syncNow()` awaiting an existing slot:** that slot
+     is the active cycle; `dispose()` awaits its completer before closing
+     streams. The trigger's own continuation does nothing after the
+     await.
+   - **Already reserved a new slot:** impossible — reservation requires
+     passing the `_disposeRequested` check, which now fails.
+3. `dispose()` awaits `_activeCycleSlot?.completer.future` (if a slot
+   exists) **before** closing `_reportController` and
+   `_conflictController`. Since no new reservation can be created after
+   `_disposeRequested` is set, and the only report/conflict emitter is
+   the awaited cycle, no event can be added to a closed controller.
+
+Auto-triggers call `syncNow()` which handles deduplication. Errors
+(including `StateError` from disposal races) are caught and logged to
+prevent unhandled asynchronous errors.
+
+### `_pushAndHandle(operation, accumulator, entityBlocked)`
+
+```
+_pushAndHandle(op, acc, entityBlocked):
   ├─ entityKey = jsonEncode([op.entityType, op.entityId])
   │
   ├─ try {
@@ -944,11 +1159,10 @@ _pushAndHandle(op, report, entityBlocked):
   │         attemptCount: op.attemptCount + 1,
   │         error: error,
   │       )
-  │       report.deadLettered++
+  │       acc.deadLettered++        ← only after successful transition
   │     } catch (e) {
-  │       // Storage transition failed — persisted state UNKNOWN.
-  │       // The operation may or may not have been dead-lettered.
-  │       // Entity remains blocked for this cycle regardless.
+  │       // Storage transition failed — persisted state UNKNOWN
+  │       acc.storageErrors++
   │       log warning
   │     }
   │     return
@@ -958,13 +1172,12 @@ _pushAndHandle(op, report, entityBlocked):
   │     case SyncSuccess:
   │       try {
   │         await localStorage.markSucceeded(op.operationId)
-  │         report.succeeded++
+  │         acc.succeeded++          ← only after successful transition
   │         // Entity NOT blocked — next op for this entity may be
   │         // considered in a later fetch within this cycle
   │       } catch (e) {
-  │         // Storage transition failed — persisted state UNKNOWN.
-  │         // The operation may or may not have been removed.
-  │         // Block entity for rest of cycle to be safe.
+  │         // Storage transition failed — persisted state UNKNOWN
+  │         acc.storageErrors++
   │         entityBlocked.add(entityKey)
   │         log warning
   │       }
@@ -980,9 +1193,10 @@ _pushAndHandle(op, report, entityBlocked):
   │             attemptCount: newAttemptCount,
   │             error: error,
   │           )
-  │           report.deadLettered++
+  │           acc.deadLettered++      ← only after successful transition
   │         } catch (e) {
   │           // Storage transition failed — persisted state UNKNOWN
+  │           acc.storageErrors++
   │           log warning
   │         }
   │       } else {
@@ -994,9 +1208,10 @@ _pushAndHandle(op, report, entityBlocked):
   │             nextRetryAt: now.add(delay),
   │             error: error,
   │           )
-  │           report.failed++
+  │           acc.failed++            ← only after successful transition
   │         } catch (e) {
   │           // Storage transition failed — persisted state UNKNOWN
+  │           acc.storageErrors++
   │           log warning
   │         }
   │       }
@@ -1014,17 +1229,18 @@ _pushAndHandle(op, report, entityBlocked):
   │           attemptCount: op.attemptCount + 1,
   │           error: error,
   │         )
-  │         report.deadLettered++
-  │         report.conflicted++
+  │         acc.deadLettered++        ← only after successful transition
+  │         acc.conflicted++           ← subset of deadLettered
   │         // Emit event ONLY after markDeadLetter completes without throwing
   │         // operation is a PRE-TRANSITION snapshot (status at fetch time)
-  │         conflictController.add(SyncConflictEvent(
+  │         _conflictController.add(SyncConflictEvent(
   │           operation: op,
   │           conflict: result,
   │         ))
   │       } catch (e) {
   │         // markDeadLetter threw — persisted state UNKNOWN.
   │         // No event emitted. Entity remains blocked for this cycle.
+  │         acc.storageErrors++
   │         log warning
   │       }
   │   }
@@ -1035,21 +1251,26 @@ _pushAndHandle(op, report, entityBlocked):
 - **Recovery once:** `recoverInFlightOperations()` runs only during
   `start()`, not during sync cycles. This prevents resetting `inFlight`
   operations belonging to another active engine instance during manual
-  syncs.
+  syncs. If recovery throws, persisted state may be partially changed —
+  the contract does not guarantee atomic recovery (Section 10).
 - **Idempotent start:** If `_started` is already `true`, `start()`
   returns immediately. Recovery executes only once per successful
   startup lifecycle.
-- **Single-flight:** `_activeCycle` is assigned synchronously before the
-  first `await`, eliminating the race condition. No `Completer` needed.
-- **Guaranteed cleanup:** A single `finally` block in `_runCycle` clears
-  `_activeCycle` on every exit path, including skipped-offline. The
-  `identical` check prevents stale cleanup from clearing a newer
-  reservation.
-- **Fixed eligibility cutoff:** `eligibilityCutoff = now` is captured at
-  cycle start and used for all `fetchEligibleOperations` calls. This
-  ensures an operation whose `nextRetryAt` becomes eligible during the
-  cycle is NOT fetched again in the same cycle — preventing same-cycle
-  retries.
+- **Single-flight via reservation token:** `_CycleSlot` is created and
+  assigned synchronously before any `await`. No race window, no reliance
+  on Future identity or async timing.
+- **Guaranteed cleanup:** A single `finally` block clears
+  `_activeCycleSlot` on every exit path — including skipped-offline —
+  and only when `identical(_activeCycleSlot, slot)`.
+- **Immutable reports:** One `_CycleAccumulator` per cycle; exactly one
+  `SyncCycleReport` built at completion with `completedAt` populated.
+- **Storage failures are reported:** Every post-push storage transition
+  failure increments `storageErrors`, making `isSuccess` false. The
+  persisted state is documented as unknown.
+- **Fixed eligibility cutoff:** `eligibilityCutoff` is captured at cycle
+  start and used for all `fetchEligibleOperations` calls. This ensures
+  an operation whose `nextRetryAt` becomes eligible during the cycle is
+  NOT fetched again in the same cycle — preventing same-cycle retries.
 - **Per-entity ordering guard:** Uses `jsonEncode([entityType,
   entityId])` for collision-safe keys. Groups operations by entity,
   sorts each group by `(sequenceNumber, createdAt, operationId)`, and
@@ -1058,9 +1279,8 @@ _pushAndHandle(op, report, entityBlocked):
 - **`markInFlight` failure aborts cycle:** If any `markInFlight` in a
   chunk fails, the cycle aborts with `cycleError` set. No remote pushes
   are started for that chunk. Previously claimed operations in the
-  chunk remain `inFlight` and will be recovered on next `start()`. The
-  persisted state of the failed claim is **unknown** — it may or may not
-  have been persisted.
+  chunk remain `inFlight` or in an unknown state and will be recovered
+  on next `start()`.
 - **All chunk claims before pushes:** All `markInFlight` calls for a
   chunk must succeed before any `remoteSync.push` is called. This
   prevents pushing operations that were not successfully claimed.
@@ -1075,10 +1295,12 @@ _pushAndHandle(op, report, entityBlocked):
 - **Result validation:** Every `SyncResult` is checked against the pushed
   operation's `operationId` before any state transition. Mismatched
   results cause immediate `markDeadLetter` (non-retryable protocol
-  violation), never `markFailed`.
+  violation), never `markFailed`. `deadLettered` increments only if the
+  transition succeeds; otherwise `storageErrors` increments.
 - **Conflict ordering:** `markDeadLetter` completes without throwing
   **before** the conflict event is emitted. The event's `operation` is
-  a pre-transition snapshot.
+  a pre-transition snapshot. A `markDeadLetter` failure increments
+  `storageErrors`, emits no event, and leaves persisted state unknown.
 
 ---
 
@@ -1220,10 +1442,10 @@ automatically prevent duplicate remote effects.
 
 **Crash scenario:** If a remote push succeeds but the local
 `markSucceeded` transition fails (or the process crashes before it
-completes), the operation remains `inFlight`. On the next `start()`,
-recovery resets it to `pending`, and it will be pushed again. Whether
-this causes a duplicate remote effect depends entirely on the remote
-adapter and backend's idempotency enforcement.
+completes), the operation remains in an unknown state. On the next
+`start()`, recovery resets it to `pending`, and it will be pushed again.
+Whether this causes a duplicate remote effect depends entirely on the
+remote adapter and backend's idempotency enforcement.
 
 **Recommendation:** Run one `SyncEngine` per outbox. If multiple engines
 are needed (e.g., different remote targets), use separate outboxes.
@@ -1266,7 +1488,7 @@ safety within a single engine instance regardless.
 | Entity unblocked after success | Not blocked; next op may be fetched |
 | FIFO | Per-entity guard prevents concurrency; global FIFO not guaranteed |
 | Cross-entity | Full parallelism |
-| Overlapping cycles | Prevented by synchronous `_activeCycle` assignment |
+| Overlapping cycles | Prevented by synchronous `_CycleSlot` reservation |
 | Same-cycle retries | Prevented by fixed eligibility cutoff |
 | Cross-instance | Not protected — idempotency enforcement is adapter/backend-dependent |
 
@@ -1404,18 +1626,20 @@ Config: initialDelay=1s, maxDelay=5m, maxAttempts=10, jitterFactor=0.2
 Cycle eligibilityCutoff = T0
 
 Push attempt 1 → SyncFailure(network, isRetryable=true)
-  → markFailed(attemptCount: 1, nextRetryAt: T0 + ~1s)
+  → markFailed(attemptCount: 1, nextRetryAt: T0 + ~1s) succeeds
+  → acc.failed++
   → nextRetryAt > T0, so NOT eligible in this cycle
 
 [Next cycle at T1 > T0 + 1s] Push attempt 2 → SyncFailure(network)
-  → markFailed(attemptCount: 2, nextRetryAt: T1 + ~2s)
-  → nextRetryAt > T1, so NOT eligible in this cycle
+  → markFailed(attemptCount: 2, nextRetryAt: T1 + ~2s) succeeds
+  → acc.failed++
 
 ... continues with exponential backoff across cycles ...
 
 Push attempt 10 → SyncFailure(network, isRetryable=true)
   → shouldDeadLetter(10, error) → true (attemptCount >= maxAttempts)
-  → markDeadLetter(attemptCount: 10, error: error)
+  → markDeadLetter(attemptCount: 10, error: error) succeeds
+  → acc.deadLettered++
 ```
 
 ### Example: non-retryable validation error
@@ -1423,7 +1647,8 @@ Push attempt 10 → SyncFailure(network, isRetryable=true)
 ```
 Push attempt 1 → SyncFailure(validation, isRetryable=false)
   → shouldDeadLetter(1, error) → true (!isRetryable)
-  → markDeadLetter(attemptCount: 1, error: error)
+  → markDeadLetter(attemptCount: 1, error: error) succeeds
+  → acc.deadLettered++
 ```
 
 Immediately dead-letters — no retry scheduled.
@@ -1434,17 +1659,20 @@ Immediately dead-letters — no retry scheduled.
 Push attempt 1 → SyncFailure(rateLimited, isRetryable=true, retryAfter=30s)
   → computeDelay: local backoff = ~1s, jittered = ~1s
                     max(~1s, 30s) = 30s
-  → markFailed(attemptCount: 1, nextRetryAt: now + 30s)
+  → markFailed(attemptCount: 1, nextRetryAt: now + 30s) succeeds
+  → acc.failed++
 
 Push attempt 5 → SyncFailure(rateLimited, isRetryable=true, retryAfter=5s)
   → computeDelay: local backoff = ~16s, jittered = ~16s
                     max(~16s, 5s) = ~16s  (local backoff wins)
-  → markFailed(attemptCount: 5, nextRetryAt: now + ~16s)
+  → markFailed(attemptCount: 5, nextRetryAt: now + ~16s) succeeds
+  → acc.failed++
 
 Push attempt 8 → SyncFailure(rateLimited, isRetryable=true, retryAfter=10m)
   → computeDelay: local backoff capped at maxDelay=5m, jittered = ~5m
                     max(~5m, 10m) = 10m  (retryAfter > maxDelay, preserved)
-  → markFailed(attemptCount: 8, nextRetryAt: now + 10m)
+  → markFailed(attemptCount: 8, nextRetryAt: now + 10m) succeeds
+  → acc.failed++
 ```
 
 ### Example: conflict
@@ -1454,11 +1682,23 @@ Push attempt 1 → SyncConflict(remoteSnapshot: {...})
   → entityBlocked.add(entityKey)
   → markDeadLetter(attemptCount: 1, error: SyncError(conflict, ...))
      └─ MUST complete without throwing before event is emitted
-  → Emit SyncConflictEvent on conflicts stream (after markDeadLetter)
-     └─ operation is PRE-TRANSITION snapshot (status at fetch time)
-  → report.deadLettered++ AND report.conflicted++
+  → On success: acc.deadLettered++, acc.conflicted++
+     → Emit SyncConflictEvent on conflicts stream
+       (operation is PRE-TRANSITION snapshot)
+  → On markDeadLetter throw: acc.storageErrors++ (no event, state unknown)
   → Operation parked — blocks later ops for same entity this cycle
   → Application receives ephemeral notification; no guaranteed resolution
+```
+
+### Example: storage transition failure
+
+```
+Push attempt 1 → SyncSuccess
+  → markSucceeded(op.operationId) THROWS
+  → acc.storageErrors++  (succeeded NOT incremented)
+  → entityBlocked.add(entityKey)
+  → Persisted state UNKNOWN — op may or may not be removed
+  → Report: isSuccess == false (storageErrors > 0)
 ```
 
 ### `attemptCount` semantics
@@ -1501,18 +1741,17 @@ The engine, upon receiving `SyncConflict`:
    **This storage transition must complete without throwing before
    proceeding.**
 3. **After** `markDeadLetter` completes without throwing, increments
-   `report.deadLettered` and `report.conflicted`, then emits a
+   `acc.deadLettered` and `acc.conflicted`, then emits a
    `SyncConflictEvent` on the `conflicts` stream containing the
    pre-transition `SyncOperation` snapshot and the `SyncConflict`
    (including `remoteSnapshot`).
 4. If `markDeadLetter` throws, the persisted state is **unknown** (the
-   operation may or may not have been dead-lettered). No event is
-   emitted, `report.deadLettered` and `report.conflicted` are not
-   incremented, and the error is logged. The entity remains blocked for
-   the rest of the cycle. The operation will be recovered to `pending`
-   on the next `start()` if it was not actually dead-lettered, and
-   retried — this is safe **only if** the remote adapter and backend
-   enforce idempotency.
+   operation may or may not have been dead-lettered).
+   `acc.storageErrors` is incremented, **no event is emitted**, and the
+   error is logged. The entity remains blocked for the rest of the cycle.
+   The operation may be recovered to `pending` on the next `start()` if
+   it was not actually dead-lettered, and retried — this is safe **only
+   if** the remote adapter and backend enforce idempotency.
 
 ### Why `deadLetter` and not `failed`?
 
@@ -1610,49 +1849,61 @@ updates. They are documented as future enhancements, **not Phase 3 scope**.
 
 ## 8. Error Handling Matrix
 
+Counter legend: `succeeded`/`failed`/`deadLettered`/`conflicted` increment
+**only after** the named storage transition completes without throwing.
+`storageErrors` increments when a post-push storage transition throws
+(persisted state unknown). `cycleError` is set for cycle-level failures
+that abort the cycle.
+
 | Scenario | Engine Behavior | Persisted State After | Report Counter |
 |----------|----------------|----------------------|----------------|
 | `SyncSuccess` + `markSucceeded` succeeds | Operation removed from outbox | Removed | `succeeded++` |
-| `SyncSuccess` + `markSucceeded` throws | Log warning, block entity for cycle | **Unknown** (may or may not be removed) | No counter |
+| `SyncSuccess` + `markSucceeded` throws | Log warning, block entity for cycle | **Unknown** (may or may not be removed) | `storageErrors++` |
 | `SyncFailure` (retryable) + `markFailed` succeeds | Operation scheduled for retry | `failed` with `nextRetryAt` | `failed++` |
-| `SyncFailure` (retryable) + `markFailed` throws | Log warning, block entity for cycle | **Unknown** | No counter |
+| `SyncFailure` (retryable) + `markFailed` throws | Log warning, block entity for cycle | **Unknown** | `storageErrors++` |
 | `SyncFailure` (non-retryable/max) + `markDeadLetter` succeeds | Operation dead-lettered | `deadLetter` | `deadLettered++` |
-| `SyncFailure` (non-retryable/max) + `markDeadLetter` throws | Log warning, block entity for cycle | **Unknown** | No counter |
+| `SyncFailure` (non-retryable/max) + `markDeadLetter` throws | Log warning, block entity for cycle | **Unknown** | `storageErrors++` |
 | `SyncConflict` + `markDeadLetter` succeeds | Operation dead-lettered, event emitted | `deadLetter` | `deadLettered++`, `conflicted++` |
-| `SyncConflict` + `markDeadLetter` throws | Log warning, block entity, no event | **Unknown** | No counter |
-| `SyncResult.operationId` mismatch | Immediate `markDeadLetter` (non-retryable), block entity | `deadLetter` (if storage succeeds) | `deadLettered++` |
-| `RemoteSyncAdapter.push` throws | Treat as `SyncFailure(unknown, isRetryable: true)` | Per retry policy | `failed++` or `deadLettered++` |
-| `markInFlight` throws (first in chunk) | **Abort cycle** with `cycleError`, no pushes | **Unknown** for failed op; previously claimed ops remain `inFlight` | `cycleError` set |
-| `markInFlight` throws (middle in chunk) | **Abort cycle**, no pushes for this chunk | **Unknown** for failed op; previously claimed ops in chunk remain `inFlight` | `cycleError` set |
-| `markInFlight` throws (last in chunk) | **Abort cycle**, no pushes for this chunk | **Unknown** for failed op; all other ops in chunk remain `inFlight` | `cycleError` set |
+| `SyncConflict` + `markDeadLetter` throws | Log warning, block entity, no event | **Unknown** | `storageErrors++` |
+| `SyncResult.operationId` mismatch + `markDeadLetter` succeeds | Immediate dead-letter (non-retryable), block entity | `deadLetter` | `deadLettered++` |
+| `SyncResult.operationId` mismatch + `markDeadLetter` throws | Block entity, log warning | **Unknown** | `storageErrors++` |
+| `RemoteSyncAdapter.push` throws | Treat as `SyncFailure(unknown, isRetryable: true)` | Per retry policy | `failed++` or `deadLettered++` or `storageErrors++` |
+| `markInFlight` throws (first in chunk) | **Abort cycle** with `cycleError`, no pushes | **Unknown** for failed op; previously claimed ops remain `inFlight` or unknown | `cycleError` set |
+| `markInFlight` throws (middle in chunk) | **Abort cycle**, no pushes for this chunk | **Unknown** for failed op; previously claimed ops in chunk remain `inFlight` or unknown | `cycleError` set |
+| `markInFlight` throws (last in chunk) | **Abort cycle**, no pushes for this chunk | **Unknown** for failed op; all other ops in chunk remain `inFlight` or unknown | `cycleError` set |
 | `fetchEligibleOperations` throws | Set `report.cycleError`, abort cycle | Unchanged | `cycleError` set |
-| `recoverInFlightOperations` throws (in `start`) | `start` throws, cleanup, `_started` remains `false` | `inFlight` ops remain; retry on next `start` | — |
+| `recoverInFlightOperations` throws (in `start`) | `start` throws, cleanup, `_started` remains `false`; persisted state may be **partially changed** (non-atomic) | Some ops may be `pending`, others `inFlight`; retry on next `start` | — |
 | Connectivity subscription fails (in `start`) | `start` throws, cleanup, `_started` remains `false` | — | — |
 | Connectivity sampling fails (in `start`) | `start` throws, cleanup, `_started` remains `false` | — | — |
-| Connectivity lost mid-push | Push fails with network error → retry policy | Per retry policy | `failed++` or `deadLettered++` |
-| Remote push succeeds but `markSucceeded` fails | Operation may be re-pushed on next cycle (recovery) | **Unknown** — may be `inFlight` or removed | No counter |
+| Connectivity lost mid-push | Push fails with network error → retry policy | Per retry policy | `failed++` or `deadLettered++` or `storageErrors++` |
+| Remote push succeeds but `markSucceeded` fails | Operation may be re-pushed on next cycle (recovery) | **Unknown** — may be `inFlight`, `pending`, or removed | `storageErrors++` |
 | App terminated mid-push | OS kills process | `inFlight` → recovered on next `start()` | — |
 | `dispose()` during startup | Set `_disposeRequested`, await startup cleanup, proceed with disposal | Depends on startup outcome | — |
 | `dispose()` during cycle | Set `_disposeRequested`, wait for cycle to complete (no timeout), close streams | `inFlight` ops recovered on next `start()` | — |
+| `dispose()` with pending auto-trigger | `_disposeRequested` blocks new reservation; pending trigger gets `StateError` (caught/logged) or awaits existing slot | — | — |
 | `syncNow()` before `start()` | Throws `StateError` | — | — |
-| `syncNow()` after `dispose()` | Throws `StateError` | — | — |
-| `start()` after `dispose()` | Throws `StateError` | — | — |
+| `syncNow()` after `dispose()` requested | Throws `StateError` | — | — |
+| `start()` after `dispose()` requested | Throws `StateError` | — | — |
 | `start()` when already started | Returns immediately (idempotent) | — | — |
 | `start()` concurrent calls | Share one `_startupFuture` | — | — |
-| `syncNow()` concurrent calls | Share one `_activeCycle` future | — | — |
+| `syncNow()` concurrent calls | Share one `_CycleSlot.completer.future` | — | — |
 | `dispose()` concurrent calls | Share one disposal Future | — | — |
-| Two sequential offline `syncNow()` calls | Each creates separate `_activeCycle`; each returns own skipped report | — | — |
+| Two sequential offline `syncNow()` calls | Each creates separate `_CycleSlot`; each returns own skipped report | — | — |
 
 ### Storage failure classification
 
-**Cycle-aborting storage failures:**
+**Cycle-aborting storage failures (set `cycleError`):**
 - `fetchEligibleOperations` throws → cannot determine what to push.
 - `markInFlight` throws → cannot safely determine whether the operation
   was claimed. Continuing could cause the same operation to be fetched
   and pushed repeatedly in an infinite loop. No remote pushes are
-  started for the chunk.
+  started for the chunk. These are **cycle-level** failures — they are
+  represented by `cycleError`, not `storageErrors`, because they abort
+  the entire cycle rather than affecting one operation's post-push
+  transition.
 
-**Operation-level storage failures (non-aborting):**
+**Operation-level storage failures (increment `storageErrors`, continue
+cycle):**
 - `markSucceeded` throws → persisted state **unknown**. The operation
   may or may not have been removed. Entity is blocked for rest of cycle.
   Other operations in the chunk can continue.
@@ -1660,13 +1911,21 @@ updates. They are documented as future enhancements, **not Phase 3 scope**.
 - `markDeadLetter` throws → persisted state **unknown**. Entity is
   blocked. For conflicts, no event is emitted.
 
+**Reporting rule:** `succeeded`, `failed`, `deadLettered`, and
+`conflicted` increment **only** when their storage transition completes
+without throwing. When a transition throws, `storageErrors` increments
+instead — the counters are mutually exclusive per operation outcome.
+`isSuccess` is `false` whenever `storageErrors > 0`, so a report can
+never indicate success when an operation-level storage failure occurred.
+
 **Rationale:** `markInFlight` is the claiming mechanism. If it fails,
 the engine cannot know whether the operation was claimed by this engine,
 another engine, or no one. Aborting is the only safe choice. Post-push
 transitions (`markSucceeded`, `markFailed`, `markDeadLetter`) are safe
-to skip because the operation remains in an unknown state and will be
-recovered on next `start()` — but this does **not** guarantee the
-operation stays `inFlight`. The persisted state is unknown.
+to continue past because the operation's persisted state is unknown and
+will be handled by recovery on next `start()` if still `inFlight` — but
+this does **not** guarantee the operation stays `inFlight`. The engine
+reports these as `storageErrors` rather than silently continuing.
 
 **Idempotency caveat:** Recovery and re-push are safe **only if** the
 remote adapter and backend enforce idempotency keys. Having an
@@ -1676,20 +1935,25 @@ remote effects.
 ### Key invariants
 
 - **No operation disappears** due to an unhandled exception. Every code
-  path either marks the operation or leaves it in a recoverable state.
-  However, a failed storage transition means the persisted state is
-  **unknown** — the operation may or may not have been transitioned.
+  path either marks the operation or leaves it in a recoverable or
+  unknown state. A failed storage transition means the persisted state
+  is **unknown** — the operation may or may not have been transitioned.
+- **Reports cannot claim success after storage failure.** Any
+  operation-level storage transition failure increments `storageErrors`,
+  which forces `isSuccess == false`.
 - **`inFlight` is recoverable on `start()` only.** Recovery does not run
   during sync cycles, preventing interference with other engine instances.
+  Recovery itself is not guaranteed atomic — a failed recovery may leave
+  persisted state partially changed.
 - **Result validation prevents cross-operation contamination.** A
   mismatched `SyncResult` never causes the wrong operation to be marked
   succeeded. It causes immediate `markDeadLetter` (non-retryable).
 - **Conflict events are emitted only after durable persistence.** If
-  `markDeadLetter` throws, no event is emitted and persisted state is
-  unknown.
+  `markDeadLetter` throws, no event is emitted, `storageErrors` is
+  incremented, and persisted state is unknown.
 - **`markInFlight` failure aborts the cycle.** The engine does not
   continue fetching when it cannot safely claim operations. No remote
-  pushes are started for the affected chunk.
+  pushes are started for the affected chunk. Represented by `cycleError`.
 - **All chunk claims before pushes.** All `markInFlight` calls for a
   chunk must succeed before any `remoteSync.push` is called.
 - **Same-cycle retries are impossible.** The fixed eligibility cutoff
@@ -1705,138 +1969,22 @@ remote effects.
 
 ## 9. Lifecycle and Disposal Behavior
 
-### `start()`
-
-```
-start()
-  ├─ if _disposeRequested → throw StateError("SyncEngine is disposed")
-  ├─ if _started → return  (idempotent)
-  ├─ if _startupFuture != null → return _startupFuture
-  ├─ _startupFuture = _performStartup()
-  └─ return _startupFuture
-
-_performStartup():
-  ├─ try {
-  │     ├─ // Step 1: Recover in-flight operations (once)
-  │     ├─ await localStorage.recoverInFlightOperations()
-  │     │   └─ if _disposeRequested → cleanup, return
-  │     │   └─ if throws → cleanup, rethrow
-  │     │
-  │     ├─ // Step 2: Initialize connectivity monitoring
-  │     ├─ _pendingConnectivityEvents = <bool>[]  ← buffer FIRST
-  │     ├─ _initializing = true                   ← set BEFORE subscribing
-  │     ├─ _connectivitySub = connectivity.onConnectivityChanged.listen(
-  │     │     (online) {
-  │     │       if (_disposeRequested) return
-  │     │       if (_initializing) {
-  │     │         _pendingConnectivityEvents.add(online)
-  │     │       } else {
-  │     │         _handleConnectivityEvent(online)
-  │     │       }
-  │     │     },
-  │     │     onError: (e) { log; }
-  │     │   )
-  │     │   └─ if throws → cleanup, rethrow
-  │     │
-  │     ├─ if _disposeRequested → cleanup, return
-  │     │
-  │     ├─ // Step 3: Sample initial connectivity
-  │     ├─ sampledConnected = await connectivity.isConnected
-  │     │   └─ if _disposeRequested → cleanup, return
-  │     │   └─ if throws → cleanup, rethrow
-  │     │
-  │     ├─ _initializing = false
-  │     ├─ _isConnected = sampledConnected
-  │     ├─ _wasConnected = sampledConnected
-  │     │
-  │     ├─ // Step 4: Reconcile buffered events
-  │     ├─ if (_pendingConnectivityEvents.isNotEmpty) {
-  │     │     final latest = _pendingConnectivityEvents.last
-  │     │     _pendingConnectivityEvents.clear()
-  │     │     _isConnected = latest
-  │     │     _wasConnected = latest
-  │     │   }
-  │     │
-  │     ├─ if _disposeRequested → cleanup, return
-  │     │
-  │     ├─ // Step 5: Mark started and schedule auto-sync
-  │     ├─ _started = true  ← BEFORE scheduling auto-sync
-  │     │
-  │     ├─ if (config.syncOnStart && _isConnected && !_disposeRequested) {
-  │     │     unawaited(_triggerAutoSync())
-  │     │   }
-  │     │
-  │     └─ _startupFuture = null
-  │
-  │ } catch (e) {
-  │     _startupFuture = null
-  │     _started = false
-  │     _initializing = false
-  │     await _connectivitySub?.cancel()
-  │     _connectivitySub = null
-  │     _pendingConnectivityEvents.clear()
-  │     rethrow
-  │ }
-```
-
-**`start()` does not await the initial auto-sync.** It sets `_started =
-true` first, then schedules `_triggerAutoSync()` via `unawaited`. The
-auto-trigger's call to `syncNow()` passes the `_started` check because
-`_started` is already `true`. The caller can `await engine.start()` and
-then `await engine.syncNow()` if they need to wait for the first cycle.
-
-### `syncNow()`
-
-```
-syncNow()
-  ├─ if _disposeRequested → throw StateError("SyncEngine is disposed")
-  ├─ if !_started → throw StateError("SyncEngine.start() must complete first")
-  ├─ if _activeCycle != null → return _activeCycle
-  ├─ _activeCycle = _runCycle()  ← synchronous assignment
-  └─ return _activeCycle
-```
-
-**Single-flight:** `_activeCycle` is assigned synchronously in
-`syncNow()` before any `await`. `_runCycle()` is called synchronously
-and returns a `Future` that is immediately assigned to `_activeCycle`.
-Two concurrent callers cannot both pass the null check because Dart's
-single-threaded event loop ensures the assignment happens before the
-second caller's continuation runs. No `Completer` is needed.
-
-**Sequential offline `syncNow()` calls:** Two sequential offline
-`syncNow()` calls each create a separate `_activeCycle` because the
-first call's `finally` block clears `_activeCycle` before the second
-call's synchronous body checks it. Each call returns its own
-skipped-offline report. This is deterministic because Dart's event loop
-processes the first call's `finally` before the second call's
-synchronous body runs.
-
-### `_triggerAutoSync()`
-
-```
-_triggerAutoSync()
-  ├─ if _disposeRequested || !_started → return
-  ├─ try {
-  │     await syncNow()
-  │   } catch (e) {
-  │     log warning  ← prevent unhandled async error
-  │   }
-```
-
-Auto-triggers call `syncNow()` which handles deduplication. Errors are
-caught and logged to prevent unhandled asynchronous errors.
+> **Authoritative pseudocode for `start()`, `syncNow()`, cycle
+> reservation, cycle execution, and result handling lives in Section 4.**
+> This section covers disposal, lifecycle edge cases, and connectivity
+> behavior only.
 
 ### `dispose()`
 
 ```
 dispose()
   ├─ if _disposeRequested → return _disposeFuture  (idempotent + shared)
-  ├─ _disposeRequested = true  ← SET IMMEDIATELY, before any await
+  ├─ _disposeRequested = true  ← SET SYNCHRONOUSLY, before any await
   ├─ _disposeFuture = _performDispose()
   └─ return _disposeFuture
 
 _performDispose():
-  ├─ // Step 1: Await startup cleanup if in progress
+  ├─ // Step 1: Await startup settlement if in progress
   ├─ if (_startupFuture != null) {
   │     try { await _startupFuture; } catch (e) { /* startup failed */ }
   │   }
@@ -1847,13 +1995,19 @@ _performDispose():
   ├─ await _connectivitySub?.cancel()
   ├─ _connectivitySub = null
   │
-  ├─ // Step 3: Wait for active cycle to complete (no timeout)
-  ├─ if (_activeCycle != null) {
-  │     await _activeCycle
+  ├─ // Step 3: Wait for active cycle reservation to complete (no timeout)
+  ├─ final slot = _activeCycleSlot
+  ├─ if (slot != null) {
+  │     await slot.completer.future
   │   }
+  │   // The cycle's finally clears _activeCycleSlot; completer.future
+  │   // completes with the report before that. No new slot can be
+  │   // reserved after _disposeRequested was set.
   │
   ├─ // Step 4: Close stream controllers
-  ├─ // (after startup, cycle, and auto-triggers have settled)
+  ├─ // Safe: no new cycle can start (syncNow throws on _disposeRequested),
+  │   // the only emitter (active cycle) has completed, and pending
+  │   // auto-triggers can only get StateError from syncNow (caught/logged).
   ├─ await _reportController.close()
   ├─ await _conflictController.close()
   │
@@ -1861,25 +2015,26 @@ _performDispose():
 ```
 
 **Disposal-requested state:** `_disposeRequested` is set to `true`
-**immediately** in `dispose()`, before any `await`. This is distinct
-from `_disposed` (which indicates disposal has completed). The
-`_disposeRequested` state:
+**synchronously** in `dispose()`, before any `await`. This is distinct
+from disposal completion. The `_disposeRequested` state:
 - Prevents `start()` from proceeding (throws `StateError`).
-- Prevents `syncNow()` from starting new cycles (throws `StateError`).
-- Causes startup to abort after the current async gap.
-- Causes connectivity events to be ignored.
-- Causes auto-triggers to return immediately.
+- Prevents `syncNow()` from reserving new cycles (throws `StateError`).
+- Causes `_triggerAutoSync()` to return immediately at its guard check.
+- Causes an in-progress `syncNow()` call that has not yet reserved to
+  throw `StateError` (caught and logged by the trigger).
+- Causes the connectivity listener to ignore events.
+- Causes an in-progress startup to abort after its current `await`.
 
 **No timeout on dispose:** The `RemoteSyncAdapter` contract has no
 cancellation support. Imposing a timeout would risk closing stream
 controllers while the active cycle can still emit events (reports,
 conflicts). Instead, `dispose()` waits indefinitely for the active cycle
-to complete. Shutdown time is bounded only by the remote adapter's own
-timeouts and the storage adapter's responsiveness.
+reservation to complete. Shutdown time is bounded only by the remote
+adapter's own timeouts and the storage adapter's responsiveness.
 
 **Disposal during startup:** If `dispose()` is called while `start()` is
 in progress (e.g., `recoverInFlightOperations()` is pending),
-`_disposeRequested` is set immediately. The startup code checks
+`_disposeRequested` is set synchronously. The startup code checks
 `_disposeRequested` after the `recoverInFlightOperations()` await and
 will not proceed to subscribe to connectivity or schedule auto-sync.
 `_performDispose` then awaits `_startupFuture` (which completes quickly
@@ -1892,13 +2047,24 @@ streams.
    recoverInFlightOperations() returns a Completer-controlled Future.
 2. Call engine.start() (do not await).
 3. Call engine.dispose() (do not await).
-4. Verify _disposeRequested is true.
+4. Verify _disposeRequested is true (synchronously after dispose() call).
 5. Complete the recoverInFlightOperations() Completer.
 6. Await both start() and dispose().
 7. Verify start() completed without setting _started (startup aborted).
 8. Verify dispose() completed: subscription cancelled, streams closed.
 9. Verify no connectivity subscription was created.
-10. Verify no sync cycle was started.
+10. Verify no sync cycle was started (no _CycleSlot reserved).
+```
+
+**Deterministic test — two sequential offline `syncNow()` calls:**
+```
+1. Start engine with syncWhenOffline=false and isConnected=false.
+2. report1 = await engine.syncNow()  → skippedOffline report, slot1 cleared
+3. report2 = await engine.syncNow()  → separate skippedOffline report
+4. Verify report1 and report2 are distinct instances.
+5. Verify each has skippedOffline=true, isSuccess=true, fetched=0.
+6. Verify no overlap: the second call did not share the first's future
+   (proven by distinct report instances and separate cycle execution).
 ```
 
 **Concurrent dispose:** The `_disposeFuture` ensures all concurrent
@@ -1908,18 +2074,27 @@ idempotency — if already true, return the existing `_disposeFuture`.
 
 ### Disposal during an active cycle
 
-- `_disposeRequested` is set to `true` immediately, preventing new
-  `syncNow()` calls from starting new cycles.
+- `_disposeRequested` is set to `true` synchronously, preventing new
+  `syncNow()` calls from reserving new cycles.
 - The active cycle continues to completion — in-flight pushes finish,
-  storage transitions complete, and the report is emitted.
-- After the cycle completes, the `finally` block in `_runCycle` clears
-  `_activeCycle` (checking `identical` to avoid clearing a newer
-  reservation).
-- Stream controllers are closed **after** `_activeCycle` completes,
-  ensuring no events are emitted after close.
+  storage transitions settle (incrementing counters or `storageErrors`),
+  the immutable report is built, emitted, and used to complete the slot's
+  completer.
+- The cycle's `finally` block clears `_activeCycleSlot` (only if
+  `identical`).
+- `dispose()` awaits `slot.completer.future`, then closes stream
+  controllers — ensuring no events are emitted after close.
 - Operations currently `inFlight` remain `inFlight` (or in an unknown
   state if a storage transition failed) and are recovered on the next
-  `start()` call.
+  `start()` call — subject to the atomicity caveat for recovery.
+
+### Auto-trigger pending at dispose time
+
+Covered in Section 4 (`_triggerAutoSync` guard strategy). Summary:
+`_disposeRequested` is set before any `await`, so any trigger that has
+not yet reserved a cycle will fail the `syncNow()` guard and be caught;
+any trigger sharing an existing cycle is covered by `dispose()` awaiting
+that slot's completer before closing streams.
 
 ### Connectivity behavior
 
@@ -1933,6 +2108,7 @@ idempotency — if already true, return the existing `_disposeFuture`.
 | Manual `syncNow()` + offline + `!syncWhenOffline` | Return skipped report |
 | Manual `syncNow()` + offline + `syncWhenOffline` | Attempt push anyway |
 | Connectivity event during `_disposeRequested` | Ignored |
+| Auto-trigger during `_disposeRequested` | Returns immediately or gets `StateError` from `syncNow` (caught/logged) |
 
 ### Initial connectivity sampling and reconciliation
 
@@ -1966,7 +2142,8 @@ connectivity event received while sampling.
   within the same cycle, even if its retry delay is very short.
 - **Dead-letter** stops automatic retries for non-retryable errors and
   max-attempt exhaustion.
-- **Cycle mutex** prevents overlapping cycles from stacking up.
+- **Cycle mutex** (`_CycleSlot`) prevents overlapping cycles from
+  stacking up.
 - **Auto-trigger errors** are caught and logged, preventing unhandled
   async errors from crashing the app.
 
@@ -2088,9 +2265,9 @@ or a configurable dispose timeout with documented risk.
 
 If `markInFlight` fails for any operation in a chunk, the entire cycle
 aborts with `cycleError`. No remote pushes are started for that chunk.
-Previously claimed operations in the chunk remain `inFlight` and will
-be recovered on next `start()`. The persisted state of the failed claim
-is **unknown**.
+Previously claimed operations in the chunk remain `inFlight` or in an
+unknown state and will be recovered on next `start()`. The persisted
+state of the failed claim is **unknown**.
 
 **Trade-off:** Safety over throughput. The alternative (continuing after
 `markInFlight` failure) risks infinite loops and duplicate pushes.
@@ -2101,13 +2278,39 @@ When a storage method (e.g., `markSucceeded`, `markFailed`,
 `markDeadLetter`) throws, the engine cannot determine whether the
 transition was persisted. The persisted state is **unknown** — the
 operation may or may not have been transitioned. The engine blocks the
-entity for the rest of the cycle and relies on recovery on the next
-`start()`.
+entity for the rest of the cycle, increments `storageErrors` (forcing
+`isSuccess == false`), and relies on recovery on the next `start()` if
+the operation remains `inFlight`.
 
 **Mitigation:** Recovery on `start()` resets `inFlight` operations to
 `pending`. Operations in other states (e.g., `failed`, `deadLetter`)
 are not recovered. The engine does not claim that post-push storage
 failures always leave an operation `inFlight`.
+
+### 13. `recoverInFlightOperations` is not guaranteed atomic
+
+If `recoverInFlightOperations()` throws partway through, some operations
+may already have been transitioned from `inFlight` to `pending` while
+others remain `inFlight`. The Core contract does not specify whether
+recovery is atomic. The engine treats the persisted state as potentially
+partially changed and retries the full startup (including recovery) on
+the next `start()` call. Adapters are expected to make recovery
+idempotent, but this is not contractually guaranteed.
+
+**Future enhancement:** Document or guarantee atomic recovery in the
+`LocalStorageAdapter` contract.
+
+### 14. `isSuccess` does not prove synchronization occurred
+
+`SyncCycleReport.isSuccess` means "no failure occurred during the cycle."
+It returns `true` for:
+- A `skippedOffline` cycle (no operations were fetched or pushed).
+- A cycle that fetched zero eligible operations.
+- A cycle where all pushed operations succeeded.
+
+Consumers must not interpret `isSuccess == true` as proof that
+synchronization occurred. Check `succeeded > 0` and
+`skippedOffline == false` for actual sync evidence.
 
 ---
 
@@ -2132,6 +2335,7 @@ The existing contracts are sufficient:
 | `LocalStorageAdapter.markResolved` | Clean conflict resolution without semantic mismatch | Breaking — new method on interface |
 | `LocalStorageAdapter.claimOperations` | Atomic claiming for multi-instance | Breaking — new method on interface |
 | `LocalStorageAdapter.fetchEligibleOperations` contract clarification | Document null/equal sequence number semantics | Non-breaking — documentation only |
+| `LocalStorageAdapter.recoverInFlightOperations` atomicity guarantee | Document or guarantee atomic recovery | Non-breaking — documentation or contract clarification |
 | Sqflite/Drift null sequence number handling | Fix NOT EXISTS and ORDER BY for null values | Non-breaking — adapter fix |
 | Hive null sequence number handling | Document or replace `?? 0` fallback | Non-breaking — adapter fix |
 | `RemoteSyncAdapter.pull` | Pull synchronization | Breaking — new method on interface |
@@ -2155,10 +2359,14 @@ These are documented for future phases but not required now.
 - `lib/src/engine/exponential_backoff_retry_policy.dart` — default impl
 - Update `lib/local_remote_synchronization.dart` — export new types
 
+**Internal (not exported):**
+- `_CycleSlot` — synchronous cycle reservation token
+- `_CycleAccumulator` — mutable per-cycle statistics accumulator
+
 **Tests:**
 - Engine lifecycle (start, syncNow, dispose)
 - `start()` idempotency (already started returns immediately)
-- `start()` retry after recovery failure
+- `start()` retry after recovery failure — including partial recovery state
 - `start()` retry after connectivity subscription failure
 - `start()` retry after connectivity sampling failure
 - Concurrent `start()` calls share one startup
@@ -2166,13 +2374,15 @@ These are documented for future phases but not required now.
 - `dispose()` during startup — **deterministic test with
   `recoverInFlightOperations()` pending via Completer**
 - `dispose()` concurrent calls share one disposal
-- Single-flight cycle reservation (concurrent `syncNow` calls)
-- **Two sequential offline `syncNow()` calls** — each returns own
-  skipped report, `_activeCycle` cleared between calls
+- Single-flight cycle reservation (concurrent `syncNow` calls share slot)
+- **Two sequential offline `syncNow()` calls** — distinct report instances,
+  separate cycles, slot cleared between calls
+- Cycle completing before completer awaited — report still delivered
 - Basic sync cycle with mock adapters
 - Connectivity-triggered sync
 - Connectivity event buffering during startup (synchronous + async)
-- Result `operationId` validation (mismatch → immediate dead-letter)
+- Result `operationId` validation (mismatch → immediate dead-letter;
+  `deadLettered++` on success, `storageErrors++` on failure)
 - Configuration validation (batchSize, maxConcurrency, retry policy args)
 - `markInFlight` failure aborts cycle (first, middle, last in chunk)
 - `markInFlight` failure: no pushes started for chunk
@@ -2180,6 +2390,14 @@ These are documented for future phases but not required now.
 - Per-entity ordering guard with `jsonEncode` keys
 - Entity blocking across cycle (failure → blocked, success → unblocked)
 - Collision-safe entity keys (entityType/entityId with `:`)
+- **Storage transition failures:** `markSucceeded`/`markFailed`/
+  `markDeadLetter` throwing → `storageErrors++`, `isSuccess == false`,
+  entity blocked, persisted state unknown
+- **Report immutability:** exactly one `SyncCycleReport` instance per
+  cycle; same instance returned by `syncNow()` and emitted on `reports`;
+  `completedAt` always populated
+- **`isSuccess` semantics:** `skippedOffline` → `isSuccess == true` but
+  `succeeded == 0`; `storageErrors > 0` → `isSuccess == false`
 
 ### Phase 3.2 — Retry and Failure Handling
 
@@ -2199,8 +2417,9 @@ These are documented for future phases but not required now.
 - `attemptCount >= 1` validation
 - Same-cycle retry prevention
 - All error handling matrix scenarios
-- Storage transition failure → persisted state unknown
-- Remote push succeeds but `markSucceeded` fails → re-push on recovery
+- Storage transition failure → `storageErrors++`, persisted state unknown
+- Remote push succeeds but `markSucceeded` fails → re-push on recovery,
+  `storageErrors++` in originating cycle's report
 
 ### Phase 3.3 — Conflict Handling
 
@@ -2211,7 +2430,7 @@ These are documented for future phases but not required now.
 
 **Tests:**
 - Conflict event emitted only after `markDeadLetter` completes without throwing
-- No event emitted if `markDeadLetter` throws
+- No event emitted if `markDeadLetter` throws → `storageErrors++`
 - Conflict stream delivery semantics (broadcast, no listener = lost)
 - Multiple conflicts in one cycle
 - Operation remains `deadLetter` after conflict
@@ -2232,7 +2451,7 @@ These are documented for future phases but not required now.
 - Max concurrency limits
 - Failed operation blocks entity but not others
 - Dead-letter blocks entity permanently
-- Result `operationId` mismatch handling
+- Result `operationId` mismatch handling (both storage outcomes)
 - Fixed eligibility cutoff prevents same-cycle retries
 - Adapter returning multiple ops per entity → guard selects earliest
 - Entity unblocked after successful `markSucceeded`
@@ -2251,8 +2470,9 @@ These are documented for future phases but not required now.
 - Connectivity loss during push
 - Disposal during active cycle (no timeout, waits for completion)
 - **Disposal during `recoverInFlightOperations()` pending**
+- **Dispose with pending auto-trigger** — no cycle starts, no emit after close
 - Multiple sequential cycles
-- `start()` failure and retry
+- `start()` failure and retry (including partial recovery)
 - Connectivity event buffering during startup (sync + async events)
 - Two sequential offline `syncNow()` calls
 
@@ -2317,9 +2537,15 @@ Future<void> main() async {
     if (report.cycleError != null) {
       print('Cycle error: ${report.cycleError}');
     }
+    if (report.storageErrors > 0) {
+      print('Storage transition failures (state unknown): ${report.storageErrors}');
+    }
     if (report.skippedOffline) {
+      // isSuccess may be true here — but NO operations were synchronized.
       print('Cycle skipped: device offline (no operations synchronized)');
     }
+    // isSuccess == true means "no failure occurred", NOT "sync happened".
+    // Check report.succeeded > 0 for actual synchronization evidence.
   });
 
   // Start engine (recovers in-flight once, begins auto-sync)
@@ -2331,8 +2557,8 @@ Future<void> main() async {
 
   // ... app runs ...
 
-  // Cleanup — sets disposal-requested immediately, waits for startup
-  // and active cycle to finish (no timeout), then closes streams
+  // Cleanup — sets disposal-requested synchronously, awaits startup
+  // and active cycle reservation (no timeout), then closes streams
   await engine.dispose();
   await localStorage.dispose();
 }
@@ -2355,10 +2581,10 @@ warrant separate ADR files:
 | `start()` idempotent when already started | Recovery executes only once per successful startup lifecycle |
 | `syncNow()` requires `start()` | Ensures recovery completes before any sync cycle |
 | `_started = true` before scheduling auto-sync | Auto-trigger cannot run while startup is incomplete |
-| Single-flight via synchronous `_activeCycle` assignment | Eliminates race condition without locking abstractions |
-| No `Completer` for cycle reservation | Synchronous assignment is sufficient in Dart's event loop |
-| Single `finally` cleanup for all cycle exits | Guarantees `_activeCycle` cleared on every path including skipped-offline |
-| `identical` check before clearing `_activeCycle` | Prevents stale cleanup from clearing newer reservation |
+| Single-flight via synchronous `_CycleSlot` reservation | Reservation token created/assigned before any await; no reliance on Future identity or async timing |
+| `_CycleSlot` holds `Completer<SyncCycleReport>` | Cycle executor completes it with the immutable report; callers share `completer.future` |
+| Single `finally` cleanup clears only own reservation | `identical(_activeCycleSlot, slot)` prevents stale cleanup; covers all exits including skipped-offline |
+| No `Completer` timing assumptions | Slot exists before cycle starts; no window where cycle completes before "Future" assigned |
 | Fixed eligibility cutoff per cycle | Prevents same-cycle retries even with short retry delays |
 | `attemptedOperationIds` defensive set | Additional guard against same-cycle duplicate attempts |
 | Per-entity key uses `jsonEncode([entityType, entityId])` | Collision-safe; prevents delimiter collisions |
@@ -2366,14 +2592,22 @@ warrant separate ADR files:
 | Entity blocked after failure/conflict/storage-error | Prevents later ops for same entity after uncertain outcome |
 | Entity unblocked after successful `markSucceeded` | Allows next op for entity in later batch |
 | All `markInFlight` before any push | Prevents pushing unclaimed operations |
-| `markInFlight` failure aborts cycle, no pushes | Cannot safely determine if operation was claimed |
+| `markInFlight` failure aborts cycle, no pushes | Cannot safely determine if operation was claimed; sets `cycleError` |
 | Storage transition failure → persisted state unknown | Storage method throwing does not prove rollback |
-| Post-push storage failures don't abort cycle | Operation state unknown; entity blocked; recovery on next start |
+| `storageErrors` counter for post-push transition failures | Report cannot indicate success when operation-level storage failure occurred; `isSuccess` forced false |
+| Outcome counters increment only after successful transition | `succeeded`/`failed`/`deadLettered`/`conflicted` mutually exclusive with `storageErrors` per operation |
+| Cycle-level storage failures use `cycleError`, not `storageErrors` | `markInFlight`/`fetchEligibleOperations` failures abort the cycle; they are not per-operation post-push transitions |
+| Immutable `SyncCycleReport` via `_CycleAccumulator` | Mutable accumulator during execution; exactly one immutable report built at completion; same instance returned and emitted |
+| `completedAt` always populated | Report constructed only at cycle completion on every exit path |
+| `isSuccess` means "no failure occurred" | Not proof of synchronization; `skippedOffline` and zero-fetch cycles also return true; consumers check `succeeded`/`skippedOffline` |
+| Post-push storage failures don't abort cycle | Operation state unknown; entity blocked; `storageErrors++`; recovery on next start |
 | Idempotency not assumed | `idempotencyKey` field does not automatically prevent duplicate remote effects |
 | Crash scenario: push succeeds but `markSucceeded` fails | Operation re-pushed on recovery; depends on backend idempotency enforcement |
-| Dispose sets `_disposeRequested` immediately | Prevents startup from scheduling work; checked after async gaps |
-| Dispose awaits startup before cancelling subscriptions | Ensures clean shutdown order |
+| `recoverInFlightOperations` not guaranteed atomic | Partial recovery possible; startup retry re-runs recovery; documented limitation |
+| Dispose sets `_disposeRequested` synchronously before any await | Prevents new reservations, triggers, and startup continuation immediately |
+| Dispose awaits startup, then slot completer, then closes streams | Guarantees no emit after close; no timeout (no cancellation in contracts) |
 | Dispose shares one Future for concurrent calls | Every caller awaits completed cleanup |
+| Auto-trigger/dispose race guarded by `_disposeRequested` | Pending triggers get StateError (caught) or await existing slot; no new work after flag set |
 | Connectivity events buffered during startup | `_initializing` and buffer set BEFORE subscribing; sync+async events buffered |
 | `retryAfter` as minimum, not override | Server delay is a floor; `maxDelay` caps local backoff only |
 | `maxDelay` does not cap `retryAfter` | Server-provided delay larger than maxDelay is preserved |
