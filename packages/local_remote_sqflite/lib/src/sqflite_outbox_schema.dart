@@ -16,7 +16,7 @@ final class SqfliteOutboxSchema {
       throw ArgumentError.value(
         tableName,
         'tableName',
-        'Invalid SQLite identifier. Must match ^[a-zA-Z_][a-zA-Z0-9_]*\$.',
+        r'Invalid SQLite identifier. Must match ^[a-zA-Z_][a-zA-Z0-9_]*$.',
       );
     }
     return tableName;

@@ -4,6 +4,7 @@ description: >-
   local_remote_synchronization ecosystem. Provides offline-first local
   persistence backed by sqflite on Android and iOS.
 version: 0.1.0
+publish_to: none
 homepage: https://github.com/youssef-ibrahim23/local-remote-synchronization
 repository: https://github.com/youssef-ibrahim23/local-remote-synchronization
 issue_tracker: https://github.com/youssef-ibrahim23/local-remote-synchronization/issues

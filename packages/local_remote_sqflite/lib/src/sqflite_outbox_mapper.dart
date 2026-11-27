@@ -103,10 +103,6 @@ final class SqfliteOutboxMapper {
       throw FormatException(
         'Corrupted outbox row for operation "$operationId": ${e.message}',
       );
-    } on ArgumentError catch (e) {
-      throw FormatException(
-        'Corrupted outbox row for operation "$operationId": ${e.message}',
-      );
     }
   }
 
@@ -120,7 +116,7 @@ final class SqfliteOutboxMapper {
 
   static String? _optionalString(Map<String, Object?> row, String key) {
     final value = row[key];
-    if (value != null && value is! String) {
+    if (value is! String?) {
       throw FormatException('Invalid string column "$key".');
     }
     return value;
@@ -136,7 +132,7 @@ final class SqfliteOutboxMapper {
 
   static int? _optionalInt(Map<String, Object?> row, String key) {
     final value = row[key];
-    if (value != null && value is! int) {
+    if (value is! int?) {
       throw FormatException('Invalid integer column "$key".');
     }
     return value;

@@ -96,7 +96,7 @@ void main() {
             entityType: 'tasks',
             entityId: 'task-1',
             type: SyncOperationType.create,
-            payload: <String, dynamic>{
+            payload: const <String, dynamic>{
               'title': 'Write tests',
               'nested': <String, dynamic>{
                 'tags': <Object?>['urgent', 1, true, null, 2.5],
