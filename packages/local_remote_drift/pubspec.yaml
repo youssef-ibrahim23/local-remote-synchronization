@@ -13,7 +13,7 @@ environment:
   sdk: ">=3.3.0 <4.0.0"
 
 dependencies:
-  drift: ^2.21.0
+  drift: ^2.31.0
   local_remote_synchronization:
     path: ../local_remote_synchronization
   uuid: ^4.5.1

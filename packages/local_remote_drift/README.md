@@ -32,6 +32,8 @@ The adapter only requires a `GeneratedDatabase` instance; it does not care
 about domain-specific tables.
 
 ```dart
+import 'dart:io';
+
 import 'package:drift/drift.dart';
 import 'package:drift/native.dart';
 import 'package:local_remote_drift/local_remote_drift.dart';
@@ -42,7 +44,7 @@ class AppDatabase extends GeneratedDatabase {
   AppDatabase(super.e);
 
   @override
-  int get schemaVersion => 1;
+  int get schemaVersion => 2;
 
   @override
   Iterable<TableInfo<Table, Object?>> get allTables => const [];
@@ -185,6 +187,8 @@ block returns.
 automatically after the transaction commits — no manual call needed.
 
 ## Nested-transaction behavior (Drift 2.31+)
+
+**Note:** The nested transaction semantics described below require Drift 2.31 or later.
 
 When `runWithTransaction` is called inside an outer `db.transaction`, Drift
 creates a **child transaction** (backed by a SQLite SAVEPOINT). The behavior is:
