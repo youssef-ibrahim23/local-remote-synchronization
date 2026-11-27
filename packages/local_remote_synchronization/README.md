@@ -47,11 +47,42 @@ lib/src/
 | Models | 🚧 Scaffolded |
 | Enums | 🚧 Scaffolded |
 | Exceptions | 🚧 Scaffolded |
-| Engine | 🗓 Planned |
+| Engine | 🚧 Phase 3.1 foundation |
 | Queue | 🗓 Planned |
 | Scheduler | 🗓 Planned |
 | Retry | 🗓 Planned |
 | Conflict | 🗓 Planned |
+
+---
+
+## SyncEngine (Phase 3.1)
+
+`SyncEngine` orchestrates a **push-only** sync cycle over the durable
+outbox: it recovers stale `inFlight` operations on `start()`, monitors
+connectivity, fetches eligible operations in batches, claims them via
+`markInFlight`, pushes them through `RemoteSyncAdapter`, and applies
+`markSucceeded` for confirmed results. Each cycle produces exactly one
+immutable `SyncCycleReport`, available via `syncNow()` and the
+`reports` stream.
+
+Phase 3.1 provides the engine foundation only. It does **not** provide
+retry scheduling or backoff, dead-letter handling, conflict detection or
+resolution, per-entity ordering guarantees beyond what the storage
+adapter's `preservePerEntityOrder` fetch option offers, pull
+synchronization, or background/OS-level scheduling.
+
+```dart
+final engine = SyncEngine(
+  localStorage: myLocalStorageAdapter,
+  remoteSync: myRemoteSyncAdapter,
+  connectivity: myConnectivityProvider,
+  config: SyncEngineConfig(batchSize: 50, maxConcurrency: 5),
+);
+
+await engine.start();          // recovers inFlight ops, subscribes to connectivity
+final report = await engine.syncNow();
+await engine.dispose();
+```
 
 ---
 
