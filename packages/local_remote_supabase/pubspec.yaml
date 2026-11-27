@@ -4,9 +4,9 @@ description: >-
   local_remote_synchronization ecosystem. Synchronises local mutations to a
   Supabase backend via the Supabase Dart client.
 version: 0.1.0
-homepage: https://github.com/your-org/local-remote-synchronization
-repository: https://github.com/your-org/local-remote-synchronization
-issue_tracker: https://github.com/your-org/local-remote-synchronization/issues
+homepage: https://github.com/youssef-ibrahim23/local-remote-synchronization
+repository: https://github.com/youssef-ibrahim23/local-remote-synchronization
+issue_tracker: https://github.com/youssef-ibrahim23/local-remote-synchronization/issues
 
 environment:
   sdk: ">=3.3.0 <4.0.0"

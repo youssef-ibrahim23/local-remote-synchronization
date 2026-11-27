@@ -352,17 +352,14 @@ void main() {
         database: db,
         operationIdGenerator: () => 'op-watch-${++counter}',
       );
-      addTearDown(() async {
-        await adapter.dispose();
-        await db.close();
-      });
+      addTearDown(db.close);
 
-      final emitted = <int>[];
-      final sub = adapter.watchPendingCount().listen(emitted.add);
-      addTearDown(sub.cancel);
+      final allEventsFuture = adapter.watchPendingCount().toList();
+      final queue = StreamIterator<int>(adapter.watchPendingCount());
+      addTearDown(queue.cancel);
 
-      await Future<void>.delayed(const Duration(milliseconds: 20));
-      expect(emitted, <int>[0]);
+      expect(await queue.moveNext(), isTrue);
+      expect(queue.current, 0);
 
       final op = await adapter.runInTransaction(
         (outbox) => outbox.enqueue(
@@ -373,12 +370,16 @@ void main() {
           ),
         ),
       );
-      await Future<void>.delayed(const Duration(milliseconds: 20));
-      expect(emitted, <int>[0, 1]);
+      expect(await queue.moveNext(), isTrue);
+      expect(queue.current, 1);
 
       await adapter.markSucceeded(op.operationId);
-      await Future<void>.delayed(const Duration(milliseconds: 20));
-      expect(emitted, <int>[0, 1, 0]);
+      expect(await queue.moveNext(), isTrue);
+      expect(queue.current, 0);
+
+      await adapter.dispose();
+      expect(await queue.moveNext(), isFalse);
+      expect(await allEventsFuture, <int>[0, 1, 0]);
     });
 
     test(
@@ -390,32 +391,12 @@ void main() {
         database: db,
         operationIdGenerator: () => 'op-race-${++counter}',
       );
-      addTearDown(() async {
-        await adapter.dispose();
-        await db.close();
-      });
-
-      final listener1 = <int>[];
-      final listener2 = <int>[];
-      final done1 = Completer<void>();
-      final done2 = Completer<void>();
+      addTearDown(db.close);
 
       // Start listening and immediately enqueue without awaiting initial count
       // so the mutation races with initial _queryPendingCount().
-      final sub1 = adapter.watchPendingCount().listen((count) {
-        listener1.add(count);
-        if (count == 1 && !done1.isCompleted) {
-          done1.complete();
-        }
-      });
-      final sub2 = adapter.watchPendingCount().listen((count) {
-        listener2.add(count);
-        if (count == 1 && !done2.isCompleted) {
-          done2.complete();
-        }
-      });
-      addTearDown(sub1.cancel);
-      addTearDown(sub2.cancel);
+      final eventsFuture1 = adapter.watchPendingCount().toList();
+      final eventsFuture2 = adapter.watchPendingCount().toList();
 
       await adapter.runInTransaction(
         (outbox) => outbox.enqueue(
@@ -426,10 +407,11 @@ void main() {
           ),
         ),
       );
-      await Future.wait<void>(<Future<void>>[done1.future, done2.future]);
-      // Yield one event-loop turn so any trailing stale initial count would
-      // arrive before assertions.
-      await Future<void>.delayed(Duration.zero);
+
+      // Closing the adapter completes both streams after all events flush.
+      await adapter.dispose();
+      final listener1 = await eventsFuture1;
+      final listener2 = await eventsFuture2;
 
       // Only [0, 1] or [1] are valid; [1, 0] or [0, 1, 0] must fail.
       expect(
@@ -447,29 +429,20 @@ void main() {
       final adapter = SqfliteLocalStorageAdapter(database: db);
       addTearDown(db.close);
 
-      final done1 = Completer<void>();
-      final done2 = Completer<void>();
-      final events1 = <int>[];
-      final events2 = <int>[];
+      final q1 = StreamIterator<int>(adapter.watchPendingCount());
+      final q2 = StreamIterator<int>(adapter.watchPendingCount());
+      addTearDown(q1.cancel);
+      addTearDown(q2.cancel);
 
-      final sub1 = adapter.watchPendingCount().listen(
-            events1.add,
-            onDone: done1.complete,
-          );
-      final sub2 = adapter.watchPendingCount().listen(
-            events2.add,
-            onDone: done2.complete,
-          );
-      addTearDown(sub1.cancel);
-      addTearDown(sub2.cancel);
+      expect(await q1.moveNext(), isTrue);
+      expect(q1.current, 0);
+      expect(await q2.moveNext(), isTrue);
+      expect(q2.current, 0);
 
-      await Future<void>.delayed(Duration.zero);
       await adapter.dispose();
 
-      await expectLater(
-        Future.wait<void>(<Future<void>>[done1.future, done2.future]),
-        completes,
-      );
+      expect(await q1.moveNext(), isFalse);
+      expect(await q2.moveNext(), isFalse);
     });
 
     test(
@@ -481,22 +454,14 @@ void main() {
         database: db,
         operationIdGenerator: () => 'op-ext-${++counter}',
       );
-      addTearDown(() async {
-        await adapter.dispose();
-        await db.close();
-      });
+      addTearDown(db.close);
 
-      final events = <int>[];
-      final initialReady = Completer<void>();
-      final sub = adapter.watchPendingCount().listen((count) {
-        events.add(count);
-        if (!initialReady.isCompleted) {
-          initialReady.complete();
-        }
-      });
-      addTearDown(sub.cancel);
-      await initialReady.future;
-      expect(events, <int>[0]);
+      final allEventsFuture = adapter.watchPendingCount().toList();
+      final queue = StreamIterator<int>(adapter.watchPendingCount());
+      addTearDown(queue.cancel);
+
+      expect(await queue.moveNext(), isTrue);
+      expect(queue.current, 0);
 
       // 1. External native transaction using outboxFor(txn).
       await db.transaction((txn) async {
@@ -512,15 +477,12 @@ void main() {
                 payload: const <String, dynamic>{'id': 't-ext'},
               ),
             );
-        // Must not emit before the external transaction commits.
-        await Future<void>.delayed(Duration.zero);
-        expect(events, <int>[0]);
       });
 
       // After commit, refreshPendingCount() notifies listeners.
       await adapter.refreshPendingCount();
-      await Future<void>.delayed(Duration.zero);
-      expect(events, <int>[0, 1]);
+      expect(await queue.moveNext(), isTrue);
+      expect(queue.current, 1);
 
       // 2. runWithTransaction() notifies automatically after commit.
       await adapter.runWithTransaction((txn, outbox) async {
@@ -537,8 +499,14 @@ void main() {
           ),
         );
       });
-      await Future<void>.delayed(Duration.zero);
-      expect(events, <int>[0, 1, 2]);
+      expect(await queue.moveNext(), isTrue);
+      expect(queue.current, 2);
+
+      await adapter.dispose();
+      expect(await queue.moveNext(), isFalse);
+      // Exactly [0, 1, 2] proves no event was emitted during the uncommitted
+      // external transaction.
+      expect(await allEventsFuture, <int>[0, 1, 2]);
     });
 
     test('failed retry eligibility requires nextRetryAt <= now and non-null',

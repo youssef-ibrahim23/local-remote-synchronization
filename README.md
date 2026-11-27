@@ -1,23 +1,23 @@
 # Local Remote Synchronization
 
-> **Database-agnostic · Backend-agnostic · Offline-First · Automatic Sync**
+> **Database-agnostic · Backend-agnostic · Offline-First · Durable Outbox**
 
-A modular, open-source Flutter package ecosystem that provides a production-ready
-Offline-First architecture with automatic background synchronization.
+A modular, open-source Dart and Flutter package ecosystem for Offline-First
+architectures based on the Outbox Pattern.
 
 ---
 
 ## Vision
 
-Modern mobile apps must work reliably without an internet connection and sync
-seamlessly when connectivity is restored. **Local Remote Synchronization** gives
-you the building blocks to do this correctly — without locking you into a
-specific database, backend, or sync strategy.
+Modern mobile apps must work reliably without an internet connection and
+persist local mutations durably until they can be synchronized. **Local Remote
+Synchronization** provides database-agnostic and backend-agnostic building
+blocks without locking you into a specific database or backend.
 
-The ecosystem is designed around strict **dependency inversion**: the Core
-package defines contracts (interfaces), and every concrete technology plugs in
-as an independent adapter package that depends on the Core — never the other way
-around.
+The ecosystem is designed around strict **dependency inversion**: the Pure Dart
+Core package defines contracts (interfaces) and immutable models, and each
+concrete technology plugs in as an independent adapter package that depends on
+the Core — never the other way around.
 
 ---
 
@@ -25,28 +25,48 @@ around.
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                        Your Flutter App                     │
-│   reads from local DB only ──► writes locally first        │
+│                Your Application (Flutter / Dart)            │
+│   owns local domain tables & DAOs · writes locally first    │
 └───────────────────┬─────────────────────────────────────────┘
                     │ depends on
 ┌───────────────────▼─────────────────────────────────────────┐
 │          local_remote_synchronization  (Core)               │
-│  Contracts · Models · Engine skeleton · Queue · Retry ·     │
-│  Conflict resolution abstractions                           │
+│                 (Pure Dart — Implemented)                   │
+│  Contracts: LocalStorageAdapter, OutboxWriter,              │
+│             RemoteSyncAdapter, ConnectivityProvider         │
+│  Models:    LocalMutation, SyncOperation, SyncResult,       │
+│             SyncError                                       │
 └──────┬─────────────────────────────────────────────┬────────┘
        │ implements                                  │ implements
 ┌──────▼──────────┐  ┌──────────────┐    ┌──────────▼──────────────────────┐
-│ local_remote_   │  │local_remote_ │    │ local_remote_supabase           │
-│ sqflite         │  │drift         │    │ local_remote_firestore          │
-│ local_remote_   │  │local_remote_ │    │ local_remote_rest               │
-│ hive            │  │...           │    │ local_remote_graphql            │
+│ local_remote_   │  │local_remote_ │    │ local_remote_supabase (Planned) │
+│ sqflite         │  │drift (Planned│    │ local_remote_firestore (Planned)│
+│ (Implemented)   │  │local_remote_ │    │ local_remote_rest (Planned)     │
+│                 │  │hive (Planned)│    │ local_remote_graphql (Planned)  │
 └─────────────────┘  └──────────────┘    └─────────────────────────────────┘
   LocalStorageAdapter                      RemoteSyncAdapter
+  (Each adapter persists its own Outbox in its chosen DB)
 ```
 
-**Key principle:** The UI reads from local storage only. Local writes are
-persisted immediately. The sync engine processes a durable operation queue in
-the background and pushes changes to the remote when connectivity is available.
+---
+
+## Current Status
+
+### Implemented
+- **Core models & contracts** (`local_remote_synchronization`): `LocalMutation`, `SyncOperation`, `SyncResult` (`SyncSuccess`, `SyncConflict`, `SyncFailure`), `SyncError`, `OutboxWriter`, `LocalStorageAdapter`, `RemoteSyncAdapter`, and `ConnectivityProvider`.
+- **Sqflite durable outbox adapter** (`local_remote_sqflite`):
+  - Transaction-safe domain writes + outbox enqueue via `runWithTransaction` and `outboxFor(txn)` + `refreshPendingCount()`.
+  - Durable SQLite outbox persistence (`sync_outbox`) with UTC timestamps, JSON payload/metadata, and indexes.
+  - Crash recovery (`recoverInFlightOperations`) for `inFlight` operations.
+  - Per-entity FIFO eligibility (`fetchEligibleOperations`) and reactive pending counts (`watchPendingCount`).
+
+### Planned
+- `SyncEngine` and push orchestration.
+- `RetryPolicy` implementations and retry orchestration.
+- `ConflictResolver` implementations.
+- `local_remote_drift` and `local_remote_hive` local adapters.
+- `local_remote_supabase`, `local_remote_firestore`, `local_remote_rest`, and `local_remote_graphql` remote adapters.
+- Optional platform background scheduling integrations (out of Core scope).
 
 ---
 
@@ -54,8 +74,8 @@ the background and pushes changes to the remote when connectivity is available.
 
 | Package | Type | Responsibility | Status |
 |---|---|---|---|
-| `local_remote_synchronization` | Core | Contracts, models, engine skeleton, queue, retry, conflict | 🚧 In Development |
-| `local_remote_sqflite` | Local adapter | `LocalStorageAdapter` via sqflite | 🗓 Planned |
+| `local_remote_synchronization` | Core (Pure Dart) | Contracts, models, enums | ✅ Phase 1 Implemented |
+| `local_remote_sqflite` | Local adapter | `LocalStorageAdapter` via Sqflite | ✅ Phase 2.1 Implemented |
 | `local_remote_drift` | Local adapter | `LocalStorageAdapter` via Drift | 🗓 Planned |
 | `local_remote_hive` | Local adapter | `LocalStorageAdapter` via Hive | 🗓 Planned |
 | `local_remote_supabase` | Remote adapter | `RemoteSyncAdapter` via Supabase | 🗓 Planned |

@@ -9,7 +9,10 @@ melos analyze
 echo "==> Checking formatting..."
 melos format
 
-echo "==> Running tests..."
+echo "==> Running Dart tests..."
 melos test
+
+echo "==> Running Flutter tests..."
+melos test:flutter
 
 echo "==> All checks passed."

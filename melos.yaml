@@ -1,6 +1,6 @@
 name: local_remote_synchronization_workspace
 
-repository: https://github.com/your-org/local-remote-synchronization
+repository: https://github.com/youssef-ibrahim23/local-remote-synchronization
 
 packages:
   - packages/*
