@@ -3,5 +3,5 @@
 library;
 
 export 'src/hive_local_storage_adapter.dart';
-export 'src/hive_outbox_mapper.dart';
 export 'src/hive_outbox_schema.dart';
+export 'src/hive_outbox_snapshot.dart';

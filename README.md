@@ -43,7 +43,8 @@ the Core — never the other way around.
 │ sqflite         │  │drift         │    │ local_remote_firestore (Planned)│
 │ (Implemented)   │  │(Implemented) │    │ local_remote_rest (Planned)     │
 │                 │  │local_remote_ │    │ local_remote_graphql (Planned)  │
-│                 │  │hive (Planned)│    │                                 │
+│                 │  │hive          │    │                                 │
+│                 │  │(Implemented) │    │                                 │
 └─────────────────┘  └──────────────┘    └─────────────────────────────────┘
   LocalStorageAdapter                      RemoteSyncAdapter
   (Each adapter persists its own Outbox in its chosen DB)
@@ -66,11 +67,16 @@ the Core — never the other way around.
   - Zone-based transaction atomicity via `runWithTransaction` and `adapter.outbox` + `refreshPendingCount()`.
   - Durable SQLite outbox persistence (`sync_outbox`), crash recovery, per-entity FIFO, and race-free `watchPendingCount`.
 
+- **Hive durable outbox adapter** (`local_remote_hive`):
+  - Pure Dart implementation using application-owned Hive boxes.
+  - Single-snapshot persistence with serialized mutations via `runWithTransaction` and `adapter.outbox` + `refreshPendingCount()`.
+  - Snapshot versioning with automatic migration, corruption detection, crash recovery, per-entity FIFO, and reactive `watchPendingCount`.
+  - **Consistency limitation:** A single Hive box write is not an unconditional crash-atomic or ACID guarantee. Hive may buffer writes in memory before flushing to disk.
+
 ### Planned
 - `SyncEngine` and push orchestration.
 - `RetryPolicy` implementations and retry orchestration.
 - `ConflictResolver` implementations.
-- `local_remote_hive` local adapter.
 - `local_remote_supabase`, `local_remote_firestore`, `local_remote_rest`, and `local_remote_graphql` remote adapters.
 - Optional platform background scheduling integrations (out of Core scope).
 
@@ -83,7 +89,7 @@ the Core — never the other way around.
 | `local_remote_synchronization` | Core (Pure Dart) | Contracts, models, enums | ✅ Phase 1 Implemented |
 | `local_remote_sqflite` | Local adapter | `LocalStorageAdapter` via Sqflite | ✅ Phase 2.1 Implemented |
 | `local_remote_drift` | Local adapter | `LocalStorageAdapter` via Drift | ✅ Phase 2.2 Implemented |
-| `local_remote_hive` | Local adapter | `LocalStorageAdapter` via Hive | 🗓 Planned |
+| `local_remote_hive` | Local adapter | `LocalStorageAdapter` via Hive | ✅ Phase 2.3 Implemented |
 | `local_remote_supabase` | Remote adapter | `RemoteSyncAdapter` via Supabase | 🗓 Planned |
 | `local_remote_firestore` | Remote adapter | `RemoteSyncAdapter` via Firestore | 🗓 Planned |
 | `local_remote_rest` | Remote adapter | `RemoteSyncAdapter` via REST HTTP | 🗓 Planned |

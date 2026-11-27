@@ -1,16 +1,19 @@
-/// Hive box name validation for the local_remote_hive outbox.
+/// Hive box name validation and outbox snapshot constants for the
+/// local_remote_hive adapter.
 final class HiveOutboxSchema {
   HiveOutboxSchema._();
 
   /// Default Hive box name used by `HiveLocalStorageAdapter`.
   static const String defaultBoxName = 'sync_outbox';
 
-  /// Metadata box name for storing adapter-internal counters.
-  static const String metadataBoxName = 'sync_outbox_meta';
+  /// Key within the outbox box that stores the serialized snapshot.
+  static const String snapshotKey = 'outbox_snapshot';
 
-  /// Key within [metadataBoxName] that stores the last assigned
-  /// `sequenceNumber`.
-  static const String sequenceCounterKey = 'sequence_counter';
+  /// Current snapshot schema version.
+  static const int currentVersion = 2;
+
+  /// Minimum snapshot schema version supported by this adapter.
+  static const int minSupportedVersion = 1;
 
   static final RegExp _boxNamePattern = RegExp(r'^[a-z][a-z0-9_]*$');
 

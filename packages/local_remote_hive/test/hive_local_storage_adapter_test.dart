@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:hive/hive.dart';
@@ -9,22 +10,19 @@ import 'package:test/test.dart';
 void main() {
   late Directory tempDir;
   late Box<String> box;
-  late Box<int> metadataBox;
 
-  Future<void> openBoxes() async {
+  Future<void> openBox() async {
     Hive.init(tempDir.path);
     box = await Hive.openBox<String>('sync_outbox');
-    metadataBox = await Hive.openBox<int>('sync_outbox_meta');
   }
 
   setUp(() async {
     tempDir = await Directory.systemTemp.createTemp('hive_outbox_test_');
-    await openBoxes();
+    await openBox();
   });
 
   tearDown(() async {
     await box.close();
-    await metadataBox.close();
     await Hive.deleteFromDisk();
     if (tempDir.existsSync()) {
       await tempDir.delete(recursive: true);
@@ -36,7 +34,6 @@ void main() {
       expect(
         () => HiveLocalStorageAdapter(
           box: box,
-          metadataBox: metadataBox,
           boxName: 'Invalid Name!',
         ),
         throwsArgumentError,
@@ -44,7 +41,6 @@ void main() {
       expect(
         () => HiveLocalStorageAdapter(
           box: box,
-          metadataBox: metadataBox,
           boxName: '123_invalid',
         ),
         throwsArgumentError,
@@ -52,7 +48,6 @@ void main() {
       expect(
         () => HiveLocalStorageAdapter(
           box: box,
-          metadataBox: metadataBox,
           boxName: 'valid_box_name',
         ),
         returnsNormally,
@@ -60,10 +55,7 @@ void main() {
     });
 
     test('ensureInitialized is idempotent', () async {
-      final adapter = HiveLocalStorageAdapter(
-        box: box,
-        metadataBox: metadataBox,
-      );
+      final adapter = HiveLocalStorageAdapter(box: box);
       addTearDown(adapter.dispose);
 
       await adapter.ensureInitialized();
@@ -77,14 +69,13 @@ void main() {
     });
   });
 
-  group('Persistence & Serialization', () {
+  group('Snapshot Persistence', () {
     test('persists and restores all fields', () async {
       final fixedNow = DateTime.utc(2026, 6, 1, 10);
       final occurredLocal = DateTime(2026, 6, 1, 9, 30);
 
       var adapter = HiveLocalStorageAdapter(
         box: box,
-        metadataBox: metadataBox,
         operationIdGenerator: () => 'op-persist-1',
         clock: () => fixedNow,
       );
@@ -110,17 +101,11 @@ void main() {
 
       await adapter.dispose();
       await box.close();
-      await metadataBox.close();
 
-      // Reopen boxes and verify persistence.
-      await openBoxes();
-      adapter = HiveLocalStorageAdapter(
-        box: box,
-        metadataBox: metadataBox,
-      );
-      addTearDown(() async {
-        await adapter.dispose();
-      });
+      // Reopen box and verify persistence.
+      await openBox();
+      adapter = HiveLocalStorageAdapter(box: box);
+      addTearDown(adapter.dispose);
 
       final fetched = await adapter.fetchEligibleOperations(
         now: fixedNow,
@@ -144,7 +129,6 @@ void main() {
     test('preserves nullable fields for delete operations', () async {
       final adapter = HiveLocalStorageAdapter(
         box: box,
-        metadataBox: metadataBox,
         operationIdGenerator: () => 'op-del-1',
         clock: () => DateTime.utc(2026, 6, 1, 12),
       );
@@ -171,6 +155,219 @@ void main() {
       expect(fetched.single.nextRetryAt, isNull);
       expect(fetched.single.lastError, isNull);
     });
+
+    test('snapshot contains schemaVersion and lastSequenceNumber', () async {
+      var counter = 0;
+      final adapter = HiveLocalStorageAdapter(
+        box: box,
+        operationIdGenerator: () => 'op-seq-${++counter}',
+      );
+      addTearDown(adapter.dispose);
+
+      await adapter.runInTransaction(
+        (outbox) async {
+          await outbox.enqueue(
+            LocalMutation(
+              entityType: 'tasks',
+              entityId: 't-1',
+              type: SyncOperationType.create,
+              payload: const <String, dynamic>{'id': 't-1'},
+            ),
+          );
+          await outbox.enqueue(
+            LocalMutation(
+              entityType: 'tasks',
+              entityId: 't-2',
+              type: SyncOperationType.create,
+              payload: const <String, dynamic>{'id': 't-2'},
+            ),
+          );
+        },
+      );
+
+      final json = box.get(HiveOutboxSchema.snapshotKey);
+      expect(json, isNotNull);
+      final decoded = jsonDecode(json!) as Map<String, dynamic>;
+      expect(decoded['schemaVersion'], HiveOutboxSchema.currentVersion);
+      expect(decoded['lastSequenceNumber'], 2);
+      expect(decoded['operations'], hasLength(2));
+    });
+  });
+
+  group('Snapshot Versioning', () {
+    test('loads current version snapshot', () async {
+      // Write a valid v2 snapshot directly.
+      final snapshot = HiveOutboxSnapshot(
+        schemaVersion: HiveOutboxSchema.currentVersion,
+        lastSequenceNumber: 5,
+        operations: <SyncOperation>[],
+      );
+      await box.put(HiveOutboxSchema.snapshotKey, snapshot.toJson());
+
+      final adapter = HiveLocalStorageAdapter(box: box);
+      addTearDown(adapter.dispose);
+
+      final ops = await adapter.fetchEligibleOperations(
+        now: DateTime.now().toUtc(),
+        limit: 10,
+      );
+      expect(ops, isEmpty);
+    });
+
+    test('migrates v1 snapshot to v2', () async {
+      // Write a v1 snapshot without lastSequenceNumber.
+      final v1Json = jsonEncode(<String, dynamic>{
+        'schemaVersion': 1,
+        'operations': <Map<String, dynamic>>[],
+      });
+      await box.put(HiveOutboxSchema.snapshotKey, v1Json);
+
+      final adapter = HiveLocalStorageAdapter(box: box);
+      addTearDown(adapter.dispose);
+
+      // Should not throw — migration happens automatically.
+      final ops = await adapter.fetchEligibleOperations(
+        now: DateTime.now().toUtc(),
+        limit: 10,
+      );
+      expect(ops, isEmpty);
+
+      // Note: The snapshot is only persisted on mutation, not on read.
+      // The migration happens in-memory during load.
+    });
+
+    test('rejects unsupported future version', () async {
+      final futureJson = jsonEncode(<String, dynamic>{
+        'schemaVersion': HiveOutboxSchema.currentVersion + 1,
+        'lastSequenceNumber': 0,
+        'operations': <Map<String, dynamic>>[],
+      });
+      await box.put(HiveOutboxSchema.snapshotKey, futureJson);
+
+      final adapter = HiveLocalStorageAdapter(box: box);
+      addTearDown(adapter.dispose);
+
+      await expectLater(
+        () => adapter.fetchEligibleOperations(
+          now: DateTime.now().toUtc(),
+          limit: 10,
+        ),
+        throwsA(isA<HiveOutboxVersionException>()),
+      );
+    });
+
+    test('rejects malformed version field', () async {
+      final badJson = jsonEncode(<String, dynamic>{
+        'schemaVersion': 'not_an_int',
+        'lastSequenceNumber': 0,
+        'operations': <Map<String, dynamic>>[],
+      });
+      await box.put(HiveOutboxSchema.snapshotKey, badJson);
+
+      final adapter = HiveLocalStorageAdapter(box: box);
+      addTearDown(adapter.dispose);
+
+      await expectLater(
+        () => adapter.fetchEligibleOperations(
+          now: DateTime.now().toUtc(),
+          limit: 10,
+        ),
+        throwsA(isA<HiveOutboxCorruptionException>()),
+      );
+    });
+  });
+
+  group('Corruption Handling', () {
+    test('throws on malformed snapshot JSON', () async {
+      await box.put(HiveOutboxSchema.snapshotKey, '{not valid json');
+
+      final adapter = HiveLocalStorageAdapter(box: box);
+      addTearDown(adapter.dispose);
+
+      await expectLater(
+        () => adapter.fetchEligibleOperations(
+          now: DateTime.now().toUtc(),
+          limit: 10,
+        ),
+        throwsA(isA<HiveOutboxCorruptionException>()),
+      );
+    });
+
+    test('throws on snapshot that is not a JSON object', () async {
+      await box.put(HiveOutboxSchema.snapshotKey, '[1, 2, 3]');
+
+      final adapter = HiveLocalStorageAdapter(box: box);
+      addTearDown(adapter.dispose);
+
+      await expectLater(
+        () => adapter.fetchEligibleOperations(
+          now: DateTime.now().toUtc(),
+          limit: 10,
+        ),
+        throwsA(isA<HiveOutboxCorruptionException>()),
+      );
+    });
+
+    test('throws on missing operations field', () async {
+      final badJson = jsonEncode(<String, dynamic>{
+        'schemaVersion': HiveOutboxSchema.currentVersion,
+        'lastSequenceNumber': 0,
+      });
+      await box.put(HiveOutboxSchema.snapshotKey, badJson);
+
+      final adapter = HiveLocalStorageAdapter(box: box);
+      addTearDown(adapter.dispose);
+
+      await expectLater(
+        () => adapter.fetchEligibleOperations(
+          now: DateTime.now().toUtc(),
+          limit: 10,
+        ),
+        throwsA(isA<HiveOutboxCorruptionException>()),
+      );
+    });
+
+    test('throws on invalid operation in snapshot', () async {
+      final badJson = jsonEncode(<String, dynamic>{
+        'schemaVersion': HiveOutboxSchema.currentVersion,
+        'lastSequenceNumber': 1,
+        'operations': <Map<String, dynamic>>[
+          {'invalid': 'operation'},
+        ],
+      });
+      await box.put(HiveOutboxSchema.snapshotKey, badJson);
+
+      final adapter = HiveLocalStorageAdapter(box: box);
+      addTearDown(adapter.dispose);
+
+      await expectLater(
+        () => adapter.fetchEligibleOperations(
+          now: DateTime.now().toUtc(),
+          limit: 10,
+        ),
+        throwsA(isA<HiveOutboxCorruptionException>()),
+      );
+    });
+
+    test('preserves corrupted data on disk', () async {
+      const corruptedData = '{corrupted snapshot data';
+      await box.put(HiveOutboxSchema.snapshotKey, corruptedData);
+
+      final adapter = HiveLocalStorageAdapter(box: box);
+      addTearDown(adapter.dispose);
+
+      // Attempt to read — should throw.
+      await expectLater(
+        () => adapter.fetchEligibleOperations(
+          now: DateTime.now().toUtc(),
+          limit: 10,
+        ),
+        throwsA(isA<HiveOutboxCorruptionException>()),
+      );
+
+      // Verify the corrupted data is still on disk (not deleted).
+      expect(box.get(HiveOutboxSchema.snapshotKey), corruptedData);
+    });
   });
 
   group('Per-Entity FIFO', () {
@@ -180,7 +377,6 @@ void main() {
       var counter = 0;
       final adapter = HiveLocalStorageAdapter(
         box: box,
-        metadataBox: metadataBox,
         operationIdGenerator: () => 'op-${++counter}',
         clock: () => t0.add(Duration(seconds: counter)),
       );
@@ -288,7 +484,6 @@ void main() {
       final t0 = DateTime.utc(2026, 6, 1, 10);
       var adapter = HiveLocalStorageAdapter(
         box: box,
-        metadataBox: metadataBox,
         operationIdGenerator: () => 'op-recover-1',
         clock: () => t0,
       );
@@ -306,13 +501,11 @@ void main() {
       await adapter.markInFlight(op.operationId);
       await adapter.dispose();
       await box.close();
-      await metadataBox.close();
 
       // Simulate restart.
-      await openBoxes();
+      await openBox();
       adapter = HiveLocalStorageAdapter(
         box: box,
-        metadataBox: metadataBox,
         clock: () => t0.add(const Duration(seconds: 5)),
       );
       addTearDown(adapter.dispose);
@@ -343,7 +536,6 @@ void main() {
       var counter = 0;
       final adapter = HiveLocalStorageAdapter(
         box: box,
-        metadataBox: metadataBox,
         operationIdGenerator: () => 'op-watch-${++counter}',
       );
       addTearDown(adapter.dispose);
@@ -382,7 +574,6 @@ void main() {
       var counter = 0;
       final adapter = HiveLocalStorageAdapter(
         box: box,
-        metadataBox: metadataBox,
         operationIdGenerator: () => 'op-race-${++counter}',
       );
       addTearDown(adapter.dispose);
@@ -419,10 +610,7 @@ void main() {
     });
 
     test('dispose completes all active watchPendingCount streams', () async {
-      final adapter = HiveLocalStorageAdapter(
-        box: box,
-        metadataBox: metadataBox,
-      );
+      final adapter = HiveLocalStorageAdapter(box: box);
       addTearDown(adapter.dispose);
 
       final q1 = StreamIterator<int>(adapter.watchPendingCount());
@@ -446,7 +634,6 @@ void main() {
       var counter = 0;
       final adapter = HiveLocalStorageAdapter(
         box: box,
-        metadataBox: metadataBox,
         operationIdGenerator: () => 'op-ext-${++counter}',
       );
       addTearDown(adapter.dispose);
@@ -484,7 +671,6 @@ void main() {
       var counter = 0;
       final adapter = HiveLocalStorageAdapter(
         box: box,
-        metadataBox: metadataBox,
         operationIdGenerator: () => 'op-retry-${++counter}',
         clock: () => t0,
       );
@@ -536,18 +722,21 @@ void main() {
         nextRetryAt: t0.subtract(const Duration(seconds: 1)),
         error: err,
       );
-      // Force failed status with NULL next_retry_at.
-      final nullOpJson = box.get(nullRetryOp.operationId);
-      if (nullOpJson != null) {
-        final nullOp = HiveOutboxMapper.fromJson(nullOpJson);
-        final updated = nullOp.copyWith(
-          status: SyncOperationStatus.failed,
-          clearNextRetryAt: true,
-        );
-        await box.put(
-          nullRetryOp.operationId,
-          HiveOutboxMapper.toJson(updated),
-        );
+
+      // Force failed status with NULL next_retry_at by directly modifying
+      // the snapshot.
+      final snapshotJson = box.get(HiveOutboxSchema.snapshotKey);
+      if (snapshotJson != null) {
+        final snapshot = HiveOutboxSnapshot.fromJson(snapshotJson);
+        for (var i = 0; i < snapshot.operations.length; i++) {
+          if (snapshot.operations[i].operationId == nullRetryOp.operationId) {
+            snapshot.operations[i] = snapshot.operations[i].copyWith(
+              status: SyncOperationStatus.failed,
+              clearNextRetryAt: true,
+            );
+          }
+        }
+        await box.put(HiveOutboxSchema.snapshotKey, snapshot.toJson());
       }
 
       final eligible = await adapter.fetchEligibleOperations(
@@ -567,7 +756,6 @@ void main() {
       var counter = 0;
       final adapter = HiveLocalStorageAdapter(
         box: box,
-        metadataBox: metadataBox,
         operationIdGenerator: () => 'op-atom-${++counter}',
       );
       addTearDown(adapter.dispose);
@@ -602,7 +790,6 @@ void main() {
       var counter = 0;
       final adapter = HiveLocalStorageAdapter(
         box: box,
-        metadataBox: metadataBox,
         operationIdGenerator: () => 'op-rollback-${++counter}',
       );
       addTearDown(adapter.dispose);
@@ -630,30 +817,195 @@ void main() {
     });
   });
 
-  group('Edge cases', () {
-    test('throws FormatException on corrupted outbox entry', () async {
+  group('Concurrency', () {
+    test('concurrent direct enqueues produce unique sequence numbers',
+        () async {
+      var counter = 0;
       final adapter = HiveLocalStorageAdapter(
         box: box,
-        metadataBox: metadataBox,
+        operationIdGenerator: () => 'op-concurrent-${++counter}',
       );
       addTearDown(adapter.dispose);
 
-      // Write corrupted JSON directly to the box.
-      await box.put('corrupt-1', '{not valid json');
-
-      // fetchEligibleOperations should skip corrupted entries.
-      final ops = await adapter.fetchEligibleOperations(
-        now: DateTime.utc(2026),
-        limit: 10,
+      // Launch multiple concurrent enqueues.
+      final futures = List.generate(
+        10,
+        (i) => adapter.outbox.enqueue(
+          LocalMutation(
+            entityType: 'tasks',
+            entityId: 't-$i',
+            type: SyncOperationType.create,
+            payload: <String, dynamic>{'index': i},
+          ),
+        ),
       );
-      expect(ops, isEmpty);
+
+      final results = await Future.wait(futures);
+
+      // All operations should have unique sequence numbers.
+      final seqNumbers = results.map((op) => op.sequenceNumber).toSet();
+      expect(seqNumbers, hasLength(10));
+
+      // Sequence numbers should be 1-10 (or some contiguous range).
+      final sortedSeqs = seqNumbers.toList()..sort();
+      expect(sortedSeqs.first, 1);
+      expect(sortedSeqs.last, 10);
+
+      // All operations should be in the snapshot.
+      final ops = await adapter.fetchEligibleOperations(
+        now: DateTime.now().toUtc().add(const Duration(minutes: 1)),
+        limit: 20,
+      );
+      expect(ops, hasLength(10));
     });
 
-    test('markSucceeded is idempotent for non-existent operation', () async {
+    test('concurrent transactions do not lose operations', () async {
+      var counter = 0;
       final adapter = HiveLocalStorageAdapter(
         box: box,
-        metadataBox: metadataBox,
+        operationIdGenerator: () => 'op-txn-${++counter}',
       );
+      addTearDown(adapter.dispose);
+
+      // Launch multiple concurrent transactions, each enqueuing 2 operations.
+      final futures = List.generate(
+        5,
+        (i) => adapter.runInTransaction((outbox) async {
+          await outbox.enqueue(
+            LocalMutation(
+              entityType: 'tasks',
+              entityId: 't-$i-a',
+              type: SyncOperationType.create,
+              payload: const <String, dynamic>{'id': 'a'},
+            ),
+          );
+          await outbox.enqueue(
+            LocalMutation(
+              entityType: 'tasks',
+              entityId: 't-$i-b',
+              type: SyncOperationType.create,
+              payload: const <String, dynamic>{'id': 'b'},
+            ),
+          );
+          return i;
+        }),
+      );
+
+      await Future.wait(futures);
+
+      // All 10 operations should be present.
+      final ops = await adapter.fetchEligibleOperations(
+        now: DateTime.now().toUtc().add(const Duration(minutes: 1)),
+        limit: 20,
+      );
+      expect(ops, hasLength(10));
+
+      // Sequence numbers should be unique.
+      final seqNumbers = ops.map((op) => op.sequenceNumber).toSet();
+      expect(seqNumbers, hasLength(10));
+    });
+
+    test('concurrent state transitions are serialized', () async {
+      var counter = 0;
+      final adapter = HiveLocalStorageAdapter(
+        box: box,
+        operationIdGenerator: () => 'op-state-${++counter}',
+      );
+      addTearDown(adapter.dispose);
+
+      // Enqueue an operation.
+      final op = await adapter.runInTransaction(
+        (outbox) => outbox.enqueue(
+          LocalMutation(
+            entityType: 'tasks',
+            entityId: 't-state',
+            type: SyncOperationType.create,
+            payload: const <String, dynamic>{'id': 't-state'},
+          ),
+        ),
+      );
+
+      // Concurrently mark in different states.
+      await Future.wait([
+        adapter.markInFlight(op.operationId),
+        adapter.markFailed(
+          op.operationId,
+          attemptCount: 1,
+          nextRetryAt: DateTime.now().toUtc().add(const Duration(minutes: 1)),
+          error: SyncError(
+            code: SyncErrorCode.network,
+            message: 'Test',
+            isRetryable: true,
+          ),
+        ),
+        adapter.markDeadLetter(
+          op.operationId,
+          attemptCount: 3,
+          error: SyncError(
+            code: SyncErrorCode.validation,
+            message: 'Test',
+            isRetryable: false,
+          ),
+        ),
+      ]);
+
+      // The final state depends on which mutation ran last.
+      // All mutations should have completed without error.
+      // The operation should still exist in the snapshot (not succeeded).
+      final snapshotJson = box.get(HiveOutboxSchema.snapshotKey);
+      expect(snapshotJson, isNotNull);
+      final snapshot = HiveOutboxSnapshot.fromJson(snapshotJson!);
+      expect(snapshot.operations, hasLength(1));
+      expect(snapshot.operations.single.operationId, op.operationId);
+      // Status should be one of the concurrent states.
+      expect(
+        snapshot.operations.single.status,
+        anyOf(
+          SyncOperationStatus.inFlight,
+          SyncOperationStatus.failed,
+          SyncOperationStatus.deadLetter,
+        ),
+      );
+    });
+
+    test('FIFO ordering preserved after concurrent writes', () async {
+      var counter = 0;
+      final adapter = HiveLocalStorageAdapter(
+        box: box,
+        operationIdGenerator: () => 'op-fifo-${++counter}',
+        clock: () =>
+            DateTime.utc(2026, 6, 1, 10).add(Duration(seconds: counter)),
+      );
+      addTearDown(adapter.dispose);
+
+      // Concurrently enqueue operations for the same entity.
+      final futures = List.generate(
+        5,
+        (i) => adapter.outbox.enqueue(
+          LocalMutation(
+            entityType: 'tasks',
+            entityId: 't-fifo',
+            type: SyncOperationType.update,
+            payload: <String, dynamic>{'seq': i},
+          ),
+        ),
+      );
+
+      final results = await Future.wait(futures);
+
+      // Only the first operation should be eligible (FIFO).
+      final eligible = await adapter.fetchEligibleOperations(
+        now: DateTime.utc(2026, 6, 1, 11),
+        limit: 10,
+      );
+      expect(eligible, hasLength(1));
+      expect(eligible.single.sequenceNumber, results.first.sequenceNumber);
+    });
+  });
+
+  group('Edge cases', () {
+    test('markSucceeded is idempotent for non-existent operation', () async {
+      final adapter = HiveLocalStorageAdapter(box: box);
       addTearDown(adapter.dispose);
 
       // Should not throw.
@@ -662,14 +1014,44 @@ void main() {
     });
 
     test('markInFlight on non-existent operation is a no-op', () async {
-      final adapter = HiveLocalStorageAdapter(
-        box: box,
-        metadataBox: metadataBox,
-      );
+      final adapter = HiveLocalStorageAdapter(box: box);
       addTearDown(adapter.dispose);
 
       // Should not throw.
       await adapter.markInFlight('non-existent');
+    });
+
+    test('markFailed on non-existent operation is a no-op', () async {
+      final adapter = HiveLocalStorageAdapter(box: box);
+      addTearDown(adapter.dispose);
+
+      // Should not throw.
+      await adapter.markFailed(
+        'non-existent',
+        attemptCount: 1,
+        nextRetryAt: DateTime.now().toUtc(),
+        error: SyncError(
+          code: SyncErrorCode.network,
+          message: 'Test',
+          isRetryable: true,
+        ),
+      );
+    });
+
+    test('markDeadLetter on non-existent operation is a no-op', () async {
+      final adapter = HiveLocalStorageAdapter(box: box);
+      addTearDown(adapter.dispose);
+
+      // Should not throw.
+      await adapter.markDeadLetter(
+        'non-existent',
+        attemptCount: 1,
+        error: SyncError(
+          code: SyncErrorCode.validation,
+          message: 'Test',
+          isRetryable: false,
+        ),
+      );
     });
   });
 }

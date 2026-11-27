@@ -1,46 +1,37 @@
-import 'package:hive/hive.dart';
 import 'package:local_remote_synchronization/local_remote_synchronization.dart';
 
-import 'hive_outbox_mapper.dart';
-import 'hive_outbox_schema.dart';
+import 'hive_outbox_snapshot.dart';
 
-/// Hive-backed [OutboxWriter] that enqueues [LocalMutation]s into a Hive box.
+/// Hive-backed [OutboxWriter] that enqueues [LocalMutation]s into a snapshot.
 ///
-/// When `buffered` is `true`, `enqueue` stores operations in memory and they
-/// are flushed to the box by `flushPending`. This provides atomicity for
-/// outbox operations within `HiveLocalStorageAdapter.runInTransaction`.
+/// This writer is used inside `HiveLocalStorageAdapter.runInTransaction`.
+/// It operates on a mutable copy of the [HiveOutboxSnapshot] and buffers
+/// operations in memory. The adapter persists the complete snapshot in a
+/// single box write after the transaction action completes successfully.
 ///
-/// When `buffered` is `false` (the default), `enqueue` writes directly to the
-/// box. This mode is used by `adapter.outbox` for external writes.
+/// Sequence numbers are allocated from `snapshot.lastSequenceNumber`, which
+/// is incremented atomically within the adapter's serialized mutation
+/// boundary.
 final class HiveOutboxWriter implements OutboxWriter {
-  /// Creates a [HiveOutboxWriter] bound to [box] and [metadataBox].
+  /// Creates a [HiveOutboxWriter] bound to [snapshot].
+  ///
+  /// [snapshot] must be a mutable working copy — changes to
+  /// `lastSequenceNumber` are applied immediately, while operations are
+  /// buffered until [flushPending] is called.
   HiveOutboxWriter({
-    required Box<String> box,
-    required Box<int> metadataBox,
+    required HiveOutboxSnapshot snapshot,
     required String Function() operationIdGenerator,
     required DateTime Function() clock,
-    bool buffered = false,
-  })  : _box = box,
-        _metadataBox = metadataBox,
+  })  : _snapshot = snapshot,
         _operationIdGenerator = operationIdGenerator,
-        _clock = clock,
-        _buffered = buffered;
+        _clock = clock;
 
-  final Box<String> _box;
-  final Box<int> _metadataBox;
+  final HiveOutboxSnapshot _snapshot;
   final String Function() _operationIdGenerator;
   final DateTime Function() _clock;
-  final bool _buffered;
 
-  /// Pending operations buffered during a transaction.
-  final Map<String, SyncOperation> _pendingOperations =
-      <String, SyncOperation>{};
-
-  /// In-memory sequence counter offset for buffered mode.
-  int _sequenceOffset = 0;
-
-  /// Base sequence number captured at transaction start (buffered mode only).
-  int _baseSequenceNumber = 0;
+  /// Operations buffered during the transaction.
+  final List<SyncOperation> _pendingOperations = <SyncOperation>[];
 
   /// Whether this writer has pending buffered operations.
   bool get hasPendingWrites => _pendingOperations.isNotEmpty;
@@ -49,81 +40,40 @@ final class HiveOutboxWriter implements OutboxWriter {
   Future<SyncOperation> enqueue(LocalMutation mutation) async {
     final now = _clock().toUtc();
     final operationId = _operationIdGenerator();
-    final initial = SyncOperation.fromMutation(
+
+    // Allocate sequence number from the snapshot's counter.
+    // The adapter serializes mutations, so this is safe.
+    _snapshot.lastSequenceNumber++;
+    final sequenceNumber = _snapshot.lastSequenceNumber;
+
+    final operation = SyncOperation.fromMutation(
       mutation,
       operationId: operationId,
       now: now,
-    );
+    ).copyWith(sequenceNumber: sequenceNumber);
 
-    final sequenceNumber = await _nextSequenceNumber();
-    final operation = initial.copyWith(sequenceNumber: sequenceNumber);
-
-    if (_buffered) {
-      _pendingOperations[operationId] = operation;
-    } else {
-      await _box.put(operationId, HiveOutboxMapper.toJson(operation));
-    }
+    _pendingOperations.add(operation);
 
     return operation;
   }
 
-  /// Flushes all buffered operations to the box and updates the sequence
-  /// counter. Only meaningful when `buffered` is `true`.
-  Future<void> flushPending() async {
+  /// Applies all buffered operations to the snapshot's operation list.
+  ///
+  /// Called by the adapter after a successful transaction. Does not persist
+  /// to Hive — the adapter handles persistence.
+  void flushPending() {
     if (_pendingOperations.isEmpty) {
       return;
     }
-
-    // Write all operations and update the counter atomically-ish.
-    final writes = <String, String>{};
-    for (final op in _pendingOperations.values) {
-      writes[op.operationId] = HiveOutboxMapper.toJson(op);
-    }
-    await _box.putAll(writes);
-
-    // Persist the final sequence counter.
-    final finalSequence = _baseSequenceNumber + _sequenceOffset;
-    await _metadataBox.put(
-      HiveOutboxSchema.sequenceCounterKey,
-      finalSequence,
-    );
-
+    _snapshot.operations.addAll(_pendingOperations);
     _pendingOperations.clear();
-    _sequenceOffset = 0;
   }
 
-  /// Discards all buffered operations without writing them.
+  /// Discards all buffered operations without applying them.
+  ///
+  /// Called by the adapter when the transaction action throws. The working
+  /// snapshot copy is discarded entirely, so no rollback is needed here.
   void discardPending() {
     _pendingOperations.clear();
-    _sequenceOffset = 0;
-  }
-
-  /// Returns the next sequence number.
-  ///
-  /// In buffered mode, uses an in-memory counter offset from the base value
-  /// captured at transaction start. In direct mode, reads and increments the
-  /// persistent counter immediately.
-  Future<int> _nextSequenceNumber() async {
-    if (_buffered) {
-      if (_sequenceOffset == 0) {
-        // Capture base on first enqueue.
-        _baseSequenceNumber = _metadataBox.get(
-              HiveOutboxSchema.sequenceCounterKey,
-              defaultValue: 0,
-            ) ??
-            0;
-      }
-      _sequenceOffset++;
-      return _baseSequenceNumber + _sequenceOffset;
-    } else {
-      final current = _metadataBox.get(
-            HiveOutboxSchema.sequenceCounterKey,
-            defaultValue: 0,
-          ) ??
-          0;
-      final next = current + 1;
-      await _metadataBox.put(HiveOutboxSchema.sequenceCounterKey, next);
-      return next;
-    }
   }
 }
