@@ -285,6 +285,30 @@ void main() {
       expect(storage.fetchCalls, 2);
     });
 
+    test(
+        'duplicate operationIds within one fetch are claimed and '
+        'pushed only once', () async {
+      engine = buildEngine(
+        config: SyncEngineConfig(
+            batchSize: 2, maxConcurrency: 2, syncOnStart: false),
+      );
+      storage.operations.add(makeOperation('op-1'));
+      final op = storage.operations.single;
+      // One fetch response containing the same operation twice.
+      storage.fetchScript.add([op, op]);
+      await engine.start();
+
+      final report = await engine.syncNow();
+
+      expect(storage.inFlightCalls, ['op-1']);
+      expect(remote.pushCalls, 1);
+      expect(report.succeeded, 1);
+      expect(report.fetched, 2); // raw adapter results, incl. duplicate
+      expect(report.cycleError, isNull);
+      expect(report.isSuccess, isTrue);
+      expect(storage.operations, isEmpty);
+    });
+
     test('no infinite loop when adapter returns only attempted IDs', () async {
       engine = buildEngine(
         config: SyncEngineConfig(batchSize: 1, syncOnStart: false),

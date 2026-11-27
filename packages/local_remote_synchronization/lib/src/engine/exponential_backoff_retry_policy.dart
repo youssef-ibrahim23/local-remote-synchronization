@@ -80,11 +80,11 @@ final class ExponentialBackoffRetryPolicy implements RetryPolicy {
         'Must be positive.',
       );
     }
-    if (jitterFactor < 0.0 || jitterFactor > 1.0) {
+    if (!jitterFactor.isFinite || jitterFactor < 0.0 || jitterFactor > 1.0) {
       throw ArgumentError.value(
         jitterFactor,
         'jitterFactor',
-        'Must be in [0.0, 1.0].',
+        'Must be finite and in [0.0, 1.0].',
       );
     }
   }

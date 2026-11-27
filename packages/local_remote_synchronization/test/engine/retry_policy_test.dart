@@ -96,6 +96,22 @@ void main() {
       );
     });
 
+    test('rejects non-finite jitterFactor', () {
+      expect(
+        () => ExponentialBackoffRetryPolicy(jitterFactor: double.nan),
+        throwsArgumentError,
+      );
+      expect(
+        () => ExponentialBackoffRetryPolicy(jitterFactor: double.infinity),
+        throwsArgumentError,
+      );
+      expect(
+        () => ExponentialBackoffRetryPolicy(
+            jitterFactor: double.negativeInfinity),
+        throwsArgumentError,
+      );
+    });
+
     test('accepts jitterFactor boundaries 0.0 and 1.0', () {
       expect(
         () => ExponentialBackoffRetryPolicy(jitterFactor: 0.0),

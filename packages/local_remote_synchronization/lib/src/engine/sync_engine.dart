@@ -359,12 +359,19 @@ final class SyncEngine {
       // fetched counts raw adapter results, before dedup filtering.
       accumulator.fetched += fetchedOperations.length;
 
-      // Filter operations already attempted this cycle. If nothing new
-      // remains, the cycle is done — this also prevents an infinite
-      // loop when an adapter keeps returning already-attempted IDs.
-      final operations = fetchedOperations
-          .where((op) => !attemptedOperationIds.contains(op.operationId))
-          .toList(growable: false);
+      // Deduplicate the response by operationId, keeping the first
+      // occurrence and its ordering, then filter IDs already attempted
+      // in earlier batches of this cycle. If nothing new remains, the
+      // cycle is done — this also prevents an infinite loop when an
+      // adapter keeps returning already-attempted IDs.
+      final seenOperationIds = <String>{};
+      final operations = <SyncOperation>[];
+      for (final op in fetchedOperations) {
+        if (seenOperationIds.add(op.operationId) &&
+            !attemptedOperationIds.contains(op.operationId)) {
+          operations.add(op);
+        }
+      }
       if (operations.isEmpty) {
         return;
       }
@@ -411,7 +418,10 @@ final class SyncEngine {
         );
       }
 
-      if (operations.length < _config.batchSize) {
+      // Continue while the adapter returned a full raw batch — a full
+      // batch of duplicates may still be followed by more eligible
+      // operations in the next fetch.
+      if (fetchedOperations.length < _config.batchSize) {
         return;
       }
     }
