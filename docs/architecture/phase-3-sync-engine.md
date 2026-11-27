@@ -761,12 +761,26 @@ final class _CycleAccumulator {
   _CycleAccumulator({required this.startedAt, required this.eligibilityCutoff});
 
   final DateTime startedAt;
+
+  /// Fixed cycle-wide eligibility cutoff — **Phase 3.2**. In Phase 3.1,
+  /// each `fetchEligibleOperations` call simply passes the current time;
+  /// the captured cutoff and its reuse across fetches arrive with retry
+  /// scheduling in Phase 3.2.
   final DateTime eligibilityCutoff;
+
   int fetched = 0;
   int succeeded = 0;
+
+  /// Populated from Phase 3.2 (failure handling).
   int failed = 0;
+
+  /// Populated from Phase 3.3 (conflict handling).
   int conflicted = 0;
+
+  /// Populated from Phase 3.2 (dead-letter decisions).
   int deadLettered = 0;
+
+  /// Populated from Phase 3.2 (operation-level storage failure reporting).
   int storageErrors = 0;
   SyncError? cycleError;
   bool skippedOffline = false;
@@ -798,7 +812,7 @@ final class _CycleAccumulator {
 | `RetryPolicy` | Interface | — |
 | `ExponentialBackoffRetryPolicy` | Default retry | `initialDelay`, `maxDelay`, `maxAttempts`, `jitterFactor`, `random?` |
 | `SyncCycleReport` | Cycle result | internal |
-| `SyncConflictEvent` | Conflict notification | internal |
+| `SyncConflictEvent` | Conflict notification — **public type introduced in Phase 3.3**, exported from the package barrel; constructor is public | `operation`, `conflict` |
 
 **No Core API changes required.** All types use existing contracts.
 
@@ -983,7 +997,9 @@ exception — funnels through a single `finally` that clears
 _executeCycle(slot):
   ├─ accumulator = _CycleAccumulator(
   │     startedAt: clock.now(),
-  │     eligibilityCutoff: clock.now(),   ← fixed-cutoff semantics: [3.2]
+  │     // [3.2] captured once; reused for every fetch this cycle.
+  │     // [3.1] fetches pass clock.now() per call instead.
+  │     eligibilityCutoff: clock.now(),
   │   )
   ├─ attemptedOperationIds = <String>{}   ← same-cycle retry guard: [3.2]
   ├─ entityBlocked = <String>{}           ← entity outcomes: [3.4]
@@ -995,6 +1011,9 @@ _executeCycle(slot):
   │       } else {
   │       loop:
   │         a. operations = await localStorage.fetchEligibleOperations(
+  │              // [3.2] now: accumulator.eligibilityCutoff (fixed
+  │              //      cycle-wide cutoff). [3.1] now: clock.now()
+  │              //      (current time per fetch; no fixed cutoff).
   │              now: accumulator.eligibilityCutoff,
   │              limit: config.batchSize,
   │              preservePerEntityOrder: true,
@@ -1183,7 +1202,7 @@ Auto-triggers call `syncNow()` which handles deduplication. Errors
 (including `StateError` from disposal races) are caught and logged to
 prevent unhandled asynchronous errors.
 
-### `_pushAndHandle(operation, accumulator, entityBlocked)` — mixed; branches annotated inline
+### `_pushAndHandle(operation, accumulator, entityBlocked)` — mixed; branches annotated inline (`entityBlocked` parameter is used from Phase 3.4)
 
 ```
 _pushAndHandle(op, acc, entityBlocked):
@@ -1204,11 +1223,22 @@ _pushAndHandle(op, acc, entityBlocked):
   │     )
   │   }
   │
-  ├─ // [3.1] Validate result.operationId before any transition;
-  │   // [3.2] mismatch → immediate dead-letter (non-retryable)
+  ├─ // operationId validation — staged behavior:
+  │   //
+  │   // [3.1 INTERIM] On mismatch, NEVER call markSucceeded (or any
+  │   //   outcome transition). Treat as a cycle-level protocol error:
+  │   //   throw to the cycle error boundary → cycleError set → cycle
+  │   //   aborts after the current chunk settles. The claimed op stays
+  │   //   inFlight → recovered to pending on next start. No outcome
+  │   //   counter is incremented for it.
+  │   //
+  │   // [3.2 FINAL] On mismatch, treat as a non-retryable protocol
+  │   //   violation → markDeadLetter; deadLettered++ only after the
+  │   //   transition succeeds, storageErrors++ if it throws. Never
+  │   //   markSucceeded/markFailed. (Pseudocode below shows FINAL.)
   │   if (result.operationId != op.operationId) {
   │     // Protocol violation — immediate dead-letter, NOT markFailed
-  │     entityBlocked.add(entityKey)  ← block entity for rest of cycle
+  │     entityBlocked.add(entityKey)  ← block entity for rest of cycle [3.4]
   │     final error = SyncError(
   │       code: SyncErrorCode.unknown,
   │       message: 'Protocol violation: result.operationId '
@@ -1370,10 +1400,13 @@ _pushAndHandle(op, acc, entityBlocked):
   fetched in a later batch iteration.
 - **Result validation** `[3.1]` / dead-letter transition `[3.2]`: Every
   `SyncResult` is checked against the pushed operation's `operationId`
-  before any state transition. Mismatched results cause immediate
-  `markDeadLetter` (non-retryable protocol violation), never
-  `markFailed`. `deadLettered` increments only if the transition
-  succeeds; otherwise `storageErrors` increments.
+  before any state transition — `markSucceeded` is never called for a
+  mismatched result. **Phase 3.1 interim:** a mismatch is a cycle-level
+  protocol error that aborts the cycle; the claimed op stays `inFlight`
+  for recovery and no outcome counter is incremented. **Phase 3.2
+  final:** a mismatch causes immediate `markDeadLetter` (non-retryable
+  protocol violation), never `markFailed`; `deadLettered` increments
+  only if the transition succeeds, otherwise `storageErrors` increments.
 - **Conflict ordering** `[3.3]`: `markDeadLetter` completes without
   throwing **before** the conflict event is emitted. The event's
   `operation` is a pre-transition snapshot. A `markDeadLetter` failure
@@ -1936,6 +1969,12 @@ that abort the cycle.
 > Rows describe **target-state** behavior (post-Phase 3.4). Retry-related
 > rows apply from Phase 3.2, conflict rows from Phase 3.3, and
 > per-entity/entity-blocking effects from Phase 3.4 — see Section 12.
+>
+> **Phase 3.1 interim exception:** the two `operationId` mismatch rows
+> below describe the Phase 3.2+ final behavior. In Phase 3.1, a mismatch
+> instead aborts the cycle with `cycleError` (cycle-level protocol
+> error); the claimed op remains `inFlight`, no outcome counter is
+> incremented, and `markDeadLetter` is not called.
 
 | Scenario | Engine Behavior | Persisted State After | Report Counter |
 |----------|----------------|----------------------|----------------|
@@ -2048,7 +2087,9 @@ remote effects.
   persisted state partially changed.
 - **Result validation prevents cross-operation contamination.** A
   mismatched `SyncResult` never causes the wrong operation to be marked
-  succeeded. It causes immediate `markDeadLetter` (non-retryable).
+  succeeded — `markSucceeded` is never called for it. From Phase 3.2 a
+  mismatch causes immediate `markDeadLetter` (non-retryable); in the
+  Phase 3.1 interim it aborts the cycle with `cycleError` instead.
 - **Conflict events are emitted only after durable persistence.** If
   `markDeadLetter` throws, no event is emitted, `storageErrors` is
   incremented, and persisted state is unknown.
@@ -2509,6 +2550,10 @@ Phase 3.2 together with failure handling.
 - Basic sync cycle with mock adapters (fetch → claim → push →
   `markSucceeded`)
 - `SyncResult.operationId` validated before `markSucceeded`
+- **Phase 3.1 interim mismatch behavior:** mismatched
+  `result.operationId` → `markSucceeded` never called; cycle aborts
+  with `cycleError`; claimed op remains `inFlight` (recovered next
+  `start()`); no outcome counter incremented; no `markDeadLetter` call
 - Connectivity-triggered sync
 - Connectivity event buffering during startup (synchronous + async)
 - Configuration validation (batchSize, maxConcurrency)
@@ -2545,8 +2590,11 @@ failure reporting, and retry-policy exception semantics.
 - Retry scheduling via `markFailed` + `nextRetryAt`
 - Max attempts → dead-letter
 - Non-retryable → immediate dead-letter
-- Result `operationId` mismatch → immediate dead-letter
-  (`deadLettered++` on success, `storageErrors++` on failure)
+- Result `operationId` mismatch → immediate dead-letter — **replaces the
+  Phase 3.1 interim cycle-abort**: non-retryable protocol violation,
+  `markDeadLetter` called, `deadLettered++` only after successful
+  persistence, `storageErrors++` if the transition throws, never
+  `succeeded`/`failed`
 - **RetryPolicy exceptions:** `shouldDeadLetter`/`computeDelay` throwing
   → cycle aborts with `cycleError` after chunk settles; op remains
   `inFlight`; recovered next `start()`; no outcome counter
