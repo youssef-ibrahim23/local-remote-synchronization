@@ -10,6 +10,8 @@ import '../enums/sync_error_code.dart';
 import '../models/sync_error.dart';
 import '../models/sync_operation.dart';
 import '../models/sync_result.dart';
+import 'exponential_backoff_retry_policy.dart';
+import 'retry_policy.dart';
 import 'sync_engine_config.dart';
 
 part 'sync_cycle_report.dart';
@@ -20,10 +22,9 @@ part 'sync_cycle_report.dart';
 /// Depends only on Core contracts. Does not know about specific
 /// databases or remote backends.
 ///
-/// Phase 3.1 scope: engine lifecycle, startup recovery, connectivity
-/// monitoring, single-flight cycle reservation, basic fetching and
-/// successful push, immutable cycle reports, and basic concurrency with
-/// storage claiming. Retry scheduling, conflict handling, and
+/// Phase 3.2 scope adds retry scheduling via [RetryPolicy], operation-
+/// level storage failure reporting, a fixed per-cycle eligibility
+/// cutoff, and same-cycle attempt deduplication. Conflict handling and
 /// per-entity ordering guards are added in later phases.
 final class SyncEngine {
   /// Creates a [SyncEngine] with the given adapters and configuration.
@@ -35,22 +36,27 @@ final class SyncEngine {
   ///   [SyncEngineConfig] is created internally.
   /// [clock] — injectable time source, primarily for testing. Defaults
   ///   to [DateTime.now].
+  /// [retryPolicy] — retry strategy for failed pushes. When `null`, an
+  ///   [ExponentialBackoffRetryPolicy] with default settings is used.
   SyncEngine({
     required LocalStorageAdapter localStorage,
     required RemoteSyncAdapter remoteSync,
     required ConnectivityProvider connectivity,
     SyncEngineConfig? config,
+    RetryPolicy? retryPolicy,
     DateTime Function()? clock,
   })  : _localStorage = localStorage,
         _remoteSync = remoteSync,
         _connectivity = connectivity,
         _config = config ?? SyncEngineConfig(),
+        _retryPolicy = retryPolicy ?? ExponentialBackoffRetryPolicy(),
         _clock = clock ?? DateTime.now;
 
   final LocalStorageAdapter _localStorage;
   final RemoteSyncAdapter _remoteSync;
   final ConnectivityProvider _connectivity;
   final SyncEngineConfig _config;
+  final RetryPolicy _retryPolicy;
   final DateTime Function() _clock;
 
   bool _started = false;
@@ -277,7 +283,13 @@ final class SyncEngine {
 
   Future<void> _executeCycle(_CycleSlot slot) async {
     final startedAt = _clock();
-    final accumulator = _CycleAccumulator(startedAt: startedAt);
+    // Phase 3.2: one immutable eligibility cutoff for the whole cycle —
+    // every fetch uses this same timestamp so an operation whose
+    // nextRetryAt becomes due mid-cycle is not retried in this cycle.
+    final accumulator = _CycleAccumulator(
+      startedAt: startedAt,
+      eligibilityCutoff: startedAt,
+    );
     try {
       try {
         if (!_config.syncWhenOffline && !_isConnected) {
@@ -315,13 +327,18 @@ final class SyncEngine {
   }
 
   Future<void> _runFetchLoop(_CycleAccumulator accumulator) async {
+    // Phase 3.2: defensive same-cycle deduplication. An ID is added only
+    // after its markInFlight claim succeeds; filtered results that are
+    // entirely already-attempted terminate the loop safely.
+    final attemptedOperationIds = <String>{};
+
     while (true) {
-      // Phase 3.1: sample the clock for EACH fetch invocation — there
-      // is no cycle-wide eligibility cutoff (added in Phase 3.2).
-      final List<SyncOperation> operations;
+      // Phase 3.2: every fetch uses the same immutable eligibility
+      // cutoff captured at cycle start.
+      final List<SyncOperation> fetchedOperations;
       try {
-        operations = await _localStorage.fetchEligibleOperations(
-          now: _clock(),
+        fetchedOperations = await _localStorage.fetchEligibleOperations(
+          now: accumulator.eligibilityCutoff,
           limit: _config.batchSize,
           preservePerEntityOrder: true,
         );
@@ -336,10 +353,21 @@ final class SyncEngine {
         return;
       }
 
+      if (fetchedOperations.isEmpty) {
+        return;
+      }
+      // fetched counts raw adapter results, before dedup filtering.
+      accumulator.fetched += fetchedOperations.length;
+
+      // Filter operations already attempted this cycle. If nothing new
+      // remains, the cycle is done — this also prevents an infinite
+      // loop when an adapter keeps returning already-attempted IDs.
+      final operations = fetchedOperations
+          .where((op) => !attemptedOperationIds.contains(op.operationId))
+          .toList(growable: false);
       if (operations.isEmpty) {
         return;
       }
-      accumulator.fetched += operations.length;
 
       for (var start = 0;
           start < operations.length;
@@ -357,6 +385,7 @@ final class SyncEngine {
           try {
             await _localStorage.markInFlight(op.operationId);
             claimed.add(op);
+            attemptedOperationIds.add(op.operationId);
           } catch (e, st) {
             accumulator.cycleError = SyncError(
               code: SyncErrorCode.storage,
@@ -373,9 +402,10 @@ final class SyncEngine {
           return;
         }
 
-        // Pushes run concurrently. _pushAndHandle rethrows on
-        // cycle-aborting failures; Future.wait waits for the whole
-        // chunk to settle before the error reaches the cycle boundary.
+        // Pushes run concurrently. _pushAndHandle lets RetryPolicy
+        // exceptions and the Phase 3.1-interim conflict abort propagate;
+        // Future.wait waits for the whole chunk to settle before the
+        // error reaches the cycle boundary.
         await Future.wait(
           claimed.map((op) => _pushAndHandle(op, accumulator)),
         );
@@ -409,69 +439,94 @@ final class SyncEngine {
 
     // operationId validation BEFORE any storage transition.
     //
-    // Phase 3.1 interim: a mismatch is a cycle-level protocol error.
-    // Never call markSucceeded/markFailed/markDeadLetter, increment no
-    // outcome counter, and abort the cycle after the current chunk
-    // settles. The claimed op stays inFlight (persisted state treated
-    // as unknown) and is recovered on the next start(). Phase 3.2
-    // replaces this with a durable markDeadLetter transition.
+    // Phase 3.2 final: a mismatch is a non-retryable protocol violation.
+    // Never call markSucceeded/markFailed. markDeadLetter is attempted;
+    // deadLettered increments only after it succeeds, storageErrors if
+    // it throws. The cycle is NOT aborted for this operation-level
+    // outcome.
     if (result.operationId != op.operationId) {
-      accumulator.cycleError = SyncError(
+      final error = SyncError(
         code: SyncErrorCode.unknown,
         message: 'Protocol violation: result.operationId '
             '(${result.operationId}) != pushed operationId '
             '(${op.operationId})',
         isRetryable: false,
       );
-      throw const _CycleAbortException();
+      try {
+        await _localStorage.markDeadLetter(
+          op.operationId,
+          attemptCount: op.attemptCount + 1,
+          error: error,
+        );
+        accumulator.deadLettered++;
+      } catch (_) {
+        // Persisted state is UNKNOWN — may be inFlight, pending,
+        // deadLetter, or unchanged. Never assume a transition applied.
+        accumulator.storageErrors++;
+      }
+      return;
     }
 
     if (result is SyncSuccess) {
       try {
         await _localStorage.markSucceeded(op.operationId);
         accumulator.succeeded++;
-      } catch (e, st) {
-        // Phase 3.1 interim: cycle-level storage error. Persisted state
+      } catch (_) {
+        // Phase 3.2: operation-level storage failure. Persisted state
         // is UNKNOWN — it may be inFlight, pending, or already removed.
-        // Rethrow so Future.wait settles the rest of the chunk before
-        // the cycle boundary aborts. Do not increment succeeded or
-        // storageErrors (storageErrors reporting is Phase 3.2).
-        accumulator.cycleError ??= SyncError(
-          code: SyncErrorCode.storage,
-          message: 'markSucceeded failed (state unknown): $e',
-          isRetryable: true,
-          cause: e,
-          stackTrace: st,
-        );
-        rethrow;
+        // The cycle continues; no outcome counter is incremented.
+        accumulator.storageErrors++;
       }
       return;
     }
 
-    // Phase 3.1 has no retry scheduling (Phase 3.2) and no conflict
-    // workflow (Phase 3.3), so a non-success result cannot be
-    // transitioned safely. Treat it as a cycle-level error: the claimed
-    // op stays inFlight and is recovered on the next start(). This is
-    // an interim Phase 3.1 behavior pending the Phase 3.2/3.3 branches.
-    if (result is SyncFailure) {
-      accumulator.cycleError = SyncError(
-        code: result.error.code,
-        message: 'Remote push failed and this version has no retry '
-            'handling: ${result.error.message}',
-        isRetryable: result.error.isRetryable,
-        retryAfter: result.error.retryAfter,
-        statusCode: result.error.statusCode,
-        cause: result.error,
-      );
-    } else {
+    // Phase 3.1 interim preserved until Phase 3.3: a SyncConflict has
+    // no transition path yet, so it remains a cycle-level abort. It is
+    // never treated as a retryable SyncFailure.
+    if (result is SyncConflict) {
       accumulator.cycleError = SyncError(
         code: SyncErrorCode.conflict,
         message: 'Remote conflict received; conflict handling is not '
             'available in this version.',
         isRetryable: false,
       );
+      throw const _CycleAbortException();
     }
-    throw const _CycleAbortException();
+
+    // result is SyncFailure — schedule a retry or dead-letter via the
+    // configured RetryPolicy.
+    final error = (result as SyncFailure).error;
+    final newAttemptCount = op.attemptCount + 1;
+
+    // Policy calls are intentionally NOT wrapped: a throw propagates
+    // through Future.wait (which lets the rest of the chunk settle)
+    // to the cycle error boundary. No transition is applied and no
+    // outcome counter is incremented for this operation.
+    if (_retryPolicy.shouldDeadLetter(newAttemptCount, error)) {
+      try {
+        await _localStorage.markDeadLetter(
+          op.operationId,
+          attemptCount: newAttemptCount,
+          error: error,
+        );
+        accumulator.deadLettered++;
+      } catch (_) {
+        accumulator.storageErrors++;
+      }
+    } else {
+      final delay = _retryPolicy.computeDelay(newAttemptCount, error);
+      try {
+        await _localStorage.markFailed(
+          op.operationId,
+          attemptCount: newAttemptCount,
+          nextRetryAt: _clock().add(delay),
+          error: error,
+        );
+        accumulator.failed++;
+      } catch (_) {
+        accumulator.storageErrors++;
+      }
+    }
   }
 }
 
@@ -490,9 +545,16 @@ final class _CycleAbortException implements Exception {
 /// Mutable per-cycle statistics accumulator. Exactly one immutable
 /// [SyncCycleReport] is built from it when the cycle completes.
 final class _CycleAccumulator {
-  _CycleAccumulator({required this.startedAt});
+  _CycleAccumulator({
+    required this.startedAt,
+    required this.eligibilityCutoff,
+  });
 
   final DateTime startedAt;
+
+  /// Immutable per-cycle eligibility cutoff. Every
+  /// `fetchEligibleOperations` call in the cycle uses this timestamp.
+  final DateTime eligibilityCutoff;
 
   int fetched = 0;
   int succeeded = 0;

@@ -10,7 +10,8 @@ push-only sync engine:
 
 - Contracts (interfaces) that adapter packages implement.
 - Typed models shared across the ecosystem.
-- The `SyncEngine` orchestration foundation (Phase 3.1 scope — see below).
+- The `SyncEngine` orchestration with retry and failure handling
+  (Phase 3.2 scope — see below).
 
 It has **zero** dependency on sqflite, Drift, Hive, Firebase, Supabase, REST clients,
 GraphQL clients, or any connectivity library. All integrations depend on this
@@ -27,8 +28,9 @@ lib/src/
 ├── models/         SyncOperation, LocalMutation, SyncResult
 │                   (SyncSuccess / SyncFailure / SyncConflict), SyncError
 ├── enums/          SyncOperationType, SyncOperationStatus, SyncErrorCode
-├── engine/         SyncEngine, SyncEngineConfig, SyncCycleReport
-│                   (Phase 3.1 foundation — see below)
+├── engine/         SyncEngine, SyncEngineConfig, SyncCycleReport,
+│                   RetryPolicy, ExponentialBackoffRetryPolicy
+│                   (Phase 3.2 scope — see below)
 ├── utils/          Internal helpers (deep immutability)
 └── core/, queue/, scheduler/, retry/, conflict/, exceptions/
                    Reserved for later phases — currently empty
@@ -46,29 +48,23 @@ lib/src/
 | Models | ✅ Implemented |
 | Enums | ✅ Implemented |
 | Exceptions | 🗓 Planned |
-| Engine | 🚧 Phase 3.1 foundation |
+| Engine | 🚧 Phase 3.2 (retry & failure handling) |
 | Queue | 🗓 Planned |
 | Scheduler | 🗓 Planned |
-| Retry | 🗓 Planned |
+| Retry | ✅ Phase 3.2 (`RetryPolicy`) |
 | Conflict | 🗓 Planned |
 
 ---
 
-## SyncEngine (Phase 3.1)
+## SyncEngine (Phase 3.2)
 
 `SyncEngine` orchestrates a **push-only** sync cycle over the durable
 outbox: it recovers stale `inFlight` operations on `start()`, monitors
 connectivity, fetches eligible operations in batches, claims them via
-`markInFlight`, pushes them through `RemoteSyncAdapter`, and applies
-`markSucceeded` for confirmed results. Each cycle produces exactly one
-immutable `SyncCycleReport`, available via `syncNow()` and the
-`reports` stream.
-
-Phase 3.1 provides the engine foundation only. It does **not** provide
-retry scheduling or backoff, dead-letter handling, conflict detection or
-resolution, per-entity ordering guarantees beyond what the storage
-adapter's `preservePerEntityOrder` fetch option offers, pull
-synchronization, or background/OS-level scheduling.
+`markInFlight`, pushes them through `RemoteSyncAdapter`, and applies the
+appropriate storage transition for each result. Each cycle produces
+exactly one immutable `SyncCycleReport`, available via `syncNow()` and
+the `reports` stream.
 
 ```dart
 final engine = SyncEngine(
@@ -82,6 +78,51 @@ await engine.start();          // recovers inFlight ops, subscribes to connectiv
 final report = await engine.syncNow();
 await engine.dispose();
 ```
+
+### Retry policy
+
+Failed pushes (`SyncFailure`, including unexpected push exceptions,
+which are wrapped as retryable failures) are handled by a `RetryPolicy`:
+
+- `shouldDeadLetter(attemptCount, error)` decides whether the operation
+  is dead-lettered. `attemptCount` is the number of **completed** push
+  attempts (`operation.attemptCount + 1`).
+- `computeDelay(attemptCount, error)` returns the delay before the next
+  attempt; the engine converts it to an absolute `nextRetryAt` using its
+  own clock and calls `markFailed`.
+
+When `retryPolicy` is omitted, `ExponentialBackoffRetryPolicy` is used:
+delay doubles per attempt from `initialDelay` (default 1s) up to
+`maxDelay` (default 5m) with ±`jitterFactor` (default 0.2) jitter, and an
+operation is dead-lettered when the error is non-retryable or
+`attemptCount >= maxAttempts` (default 10). `SyncError.retryAfter` is
+honored as a **minimum** delay and is never capped by `maxDelay`.
+
+Retries happen on **future sync cycles** — there is no timer or
+background scheduler; an operation becomes eligible again only when its
+`nextRetryAt` is due and a new cycle runs. Each cycle also uses a single
+fixed eligibility cutoff captured at cycle start, so an operation whose
+retry becomes due mid-cycle is not retried in that same cycle, and an
+operation is never pushed twice within one cycle.
+
+A mismatched `result.operationId` is treated as a non-retryable protocol
+violation and dead-lettered. `SyncConflict` results still abort the
+cycle — conflict handling arrives in a later phase.
+
+### Storage errors
+
+`markSucceeded`/`markFailed`/`markDeadLetter` failures are
+operation-level: they increment `SyncCycleReport.storageErrors`, do not
+increment the corresponding outcome counter, and do not abort the cycle.
+Persisted state is unknown after such a failure. Cycle-level storage
+failures (`fetchEligibleOperations`, `markInFlight`) still set
+`cycleError` and abort. `SyncCycleReport.isSuccess` is `false` whenever
+`storageErrors > 0`.
+
+Phase 3.2 does **not** provide conflict detection or resolution,
+per-entity ordering guarantees beyond what the storage adapter's
+`preservePerEntityOrder` fetch option offers, pull synchronization, or
+background/OS-level scheduling.
 
 ---
 

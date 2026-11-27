@@ -14,6 +14,7 @@ void main() {
 
   SyncEngine buildEngine({
     SyncEngineConfig? config,
+    RetryPolicy? retryPolicy,
     DateTime Function()? clock,
   }) {
     events = <String>[];
@@ -25,6 +26,7 @@ void main() {
       remoteSync: remote,
       connectivity: connectivity,
       config: config ?? SyncEngineConfig(syncOnStart: false),
+      retryPolicy: retryPolicy,
       clock: clock,
     );
   }
@@ -253,30 +255,29 @@ void main() {
       expect(storage.operations, isEmpty);
     });
 
-    test('mismatched operationId aborts cycle without transitions', () async {
+    test('mismatched operationId is dead-lettered without success/failure',
+        () async {
       storage.operations.add(makeOperation('op-1'));
       remote.resultFor = (op) => SyncSuccess(operationId: 'different-id');
       await engine.start();
 
       final report = await engine.syncNow();
 
-      // No outcome transition of any kind.
+      // Phase 3.2: protocol violation -> markDeadLetter only.
       expect(storage.succeededCalls, isEmpty);
       expect(storage.failedCalls, isEmpty);
-      expect(storage.deadLetterCalls, isEmpty);
+      expect(storage.deadLetterCalls, ['op-1']);
+      expect(storage.deadLetterTransitions.single.attemptCount, 1);
       expect(report.succeeded, 0);
       expect(report.failed, 0);
-      expect(report.deadLettered, 0);
+      expect(report.deadLettered, 1);
       expect(report.storageErrors, 0);
-      // Cycle-level protocol error.
-      expect(report.cycleError, isNotNull);
-      expect(report.cycleError!.code, SyncErrorCode.unknown);
+      expect(report.cycleError, isNull);
       expect(report.isSuccess, isFalse);
-      // Operation remains inFlight (state treated as unknown).
-      expect(storage.statusOf('op-1'), SyncOperationStatus.inFlight);
+      expect(storage.statusOf('op-1'), SyncOperationStatus.deadLetter);
     });
 
-    test('mismatch aborts after the current chunk settles', () async {
+    test('mismatch settles the chunk and the cycle continues', () async {
       engine = buildEngine(
         config: SyncEngineConfig(
             batchSize: 2, maxConcurrency: 2, syncOnStart: false),
@@ -296,23 +297,26 @@ void main() {
       await waitFor(() => remote.pushCalls == 2);
 
       // op-1 mismatches; op-2 still completes its transition because
-      // Future.wait settles the whole chunk before aborting.
+      // Future.wait settles the whole chunk.
       remote.gates['op-1']!.complete(
         SyncSuccess(operationId: 'wrong-id'),
       );
       remote.gates['op-2']!.complete(SyncSuccess(operationId: 'op-2'));
 
       final report = await reportFuture;
-      expect(report.cycleError, isNotNull);
+      // No cycle abort: the mismatch is an operation-level outcome.
+      expect(report.cycleError, isNull);
       expect(report.succeeded, 1); // only op-2
+      expect(report.deadLettered, 1); // op-1 protocol violation
       expect(storage.succeededCalls, ['op-2']);
-      // Cycle aborted — no further fetch iterations.
-      expect(storage.fetchCalls, 1);
+      expect(storage.deadLetterCalls, ['op-1']);
+      // Cycle continued — the full batch triggered a second fetch.
+      expect(storage.fetchCalls, 2);
     });
   });
 
-  group('Phase 3.1 interim failure handling', () {
-    test('markSucceeded failure sets cycleError and aborts', () async {
+  group('Phase 3.2 failure handling', () {
+    test('markSucceeded failure counts storageErrors and continues', () async {
       engine = buildEngine(
         config: SyncEngineConfig(
             batchSize: 2, maxConcurrency: 2, syncOnStart: false),
@@ -337,16 +341,15 @@ void main() {
       // Chunk settled: op-2's transition completed.
       expect(storage.succeededCalls, contains('op-2'));
       expect(report.succeeded, 1);
-      // op-1's failure is cycle-level, not operation-level.
-      expect(report.cycleError, isNotNull);
-      expect(report.cycleError!.code, SyncErrorCode.storage);
-      expect(report.storageErrors, 0);
+      // op-1's transition failure is operation-level, not cycle-level.
+      expect(report.cycleError, isNull);
+      expect(report.storageErrors, 1);
       expect(report.isSuccess, isFalse);
-      // Cycle aborted — no second fetch even though the batch was full.
-      expect(storage.fetchCalls, 1);
+      // Cycle continued — the full batch triggered a second fetch.
+      expect(storage.fetchCalls, 2);
     });
 
-    test('SyncFailure result aborts cycle as cycle-level error', () async {
+    test('SyncFailure result schedules retry via markFailed', () async {
       storage.operations.add(makeOperation('op-1'));
       remote.resultFor = (op) => SyncFailure(
             operationId: op.operationId,
@@ -360,18 +363,18 @@ void main() {
 
       final report = await engine.syncNow();
 
-      // Phase 3.1 has no retry scheduling: no markFailed/markDeadLetter.
-      expect(storage.failedCalls, isEmpty);
+      expect(storage.failedCalls, ['op-1']);
       expect(storage.deadLetterCalls, isEmpty);
       expect(storage.succeededCalls, isEmpty);
-      expect(report.cycleError, isNotNull);
+      expect(report.cycleError, isNull);
       expect(report.isSuccess, isFalse);
-      expect(report.failed, 0);
+      expect(report.failed, 1);
       expect(report.deadLettered, 0);
-      expect(storage.statusOf('op-1'), SyncOperationStatus.inFlight);
+      expect(storage.statusOf('op-1'), SyncOperationStatus.failed);
     });
 
-    test('SyncConflict result aborts cycle as cycle-level error', () async {
+    test('SyncConflict result still aborts cycle (Phase 3.3 pending)',
+        () async {
       storage.operations.add(makeOperation('op-1'));
       remote.resultFor = (op) => SyncConflict(
             operationId: op.operationId,
@@ -389,31 +392,27 @@ void main() {
       expect(report.isSuccess, isFalse);
     });
 
-    test('remote push throw is wrapped and aborts cycle', () async {
+    test('remote push throw is converted to retryable SyncFailure', () async {
       storage.operations.add(makeOperation('op-1'));
       remote.throwFor = (op) => StateError('adapter exploded');
       await engine.start();
 
       final report = await engine.syncNow();
 
-      expect(report.cycleError, isNotNull);
-      expect(report.isSuccess, isFalse);
-      expect(storage.succeededCalls, isEmpty);
-      expect(storage.statusOf('op-1'), SyncOperationStatus.inFlight);
+      // Unexpected push errors become retryable SyncFailures handled by
+      // the retry policy — not cycle-level errors.
+      expect(report.cycleError, isNull);
+      expect(report.failed, 1);
+      expect(storage.failedCalls, ['op-1']);
+      expect(storage.statusOf('op-1'), SyncOperationStatus.failed);
     });
   });
 
-  group('eligibility time', () {
-    test('each fetch samples the clock independently', () async {
+  group('eligibility cutoff', () {
+    test('all fetches in a cycle use the same fixed cutoff', () async {
       final base = DateTime.utc(2024, 6, 1);
       var tick = 0;
-      final clockReadings = <DateTime>[];
-      DateTime fakeClock() {
-        final value = base.add(Duration(minutes: tick));
-        clockReadings.add(value);
-        tick++;
-        return value;
-      }
+      DateTime fakeClock() => base.add(Duration(minutes: tick++));
 
       engine = buildEngine(
         config: SyncEngineConfig(batchSize: 1, syncOnStart: false),
@@ -426,22 +425,11 @@ void main() {
       await engine.start();
       final report = await engine.syncNow();
 
-      // fetch calls: op-1 batch, op-2 batch, empty batch — each got its
-      // own clock reading (no fixed cycle-wide cutoff).
+      // Phase 3.2: every fetch receives the identical cycle-start
+      // cutoff, regardless of later clock readings.
       expect(storage.fetchNows.length, 3);
-      expect(storage.fetchNows[0], isNot(storage.fetchNows[1]));
-      expect(storage.fetchNows[1], isNot(storage.fetchNows[2]));
-      expect(storage.fetchNows[0].isBefore(storage.fetchNows[1]), isTrue);
-      expect(storage.fetchNows[1].isBefore(storage.fetchNows[2]), isTrue);
-
-      // The fetch times are distinct clock readings, not one cutoff.
-      // startedAt consumed reading 0; the three fetches consumed
-      // readings 1..3; completedAt consumed reading 4.
-      expect(storage.fetchNows, [
-        clockReadings[1],
-        clockReadings[2],
-        clockReadings[3],
-      ]);
+      expect(storage.fetchNows.toSet().length, 1);
+      expect(storage.fetchNows.first, report.startedAt);
       expect(report.succeeded, 2);
     });
   });

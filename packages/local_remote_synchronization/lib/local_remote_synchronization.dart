@@ -5,6 +5,8 @@ export 'src/contracts/connectivity_provider.dart';
 export 'src/contracts/local_storage_adapter.dart';
 export 'src/contracts/outbox_writer.dart';
 export 'src/contracts/remote_sync_adapter.dart';
+export 'src/engine/exponential_backoff_retry_policy.dart';
+export 'src/engine/retry_policy.dart';
 export 'src/engine/sync_engine.dart';
 export 'src/engine/sync_engine_config.dart';
 export 'src/enums/sync_error_code.dart';

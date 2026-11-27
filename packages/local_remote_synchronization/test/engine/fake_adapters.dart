@@ -32,7 +32,28 @@ final class FakeLocalStorageAdapter implements LocalStorageAdapter {
 
   int fetchCalls = 0;
   final List<DateTime> fetchNows = <DateTime>[];
+  final List<int> fetchLimits = <int>[];
   Error? fetchError;
+
+  /// Optional scripted fetch results, consumed one list per call in
+  /// order. Once exhausted, normal eligibility filtering resumes.
+  /// Lets tests force the adapter to return already-attempted or
+  /// otherwise ineligible operations.
+  final List<List<SyncOperation>> fetchScript = <List<SyncOperation>>[];
+
+  /// `nextRetryAt` values recorded by `markFailed`, keyed by
+  /// operationId. Consulted by eligibility checks so `failed`
+  /// operations behave like real adapters.
+  final Map<String, DateTime> nextRetryAtOverrides = <String, DateTime>{};
+
+  /// Recorded arguments of `markFailed` transitions, in call order.
+  final List<({String operationId, int attemptCount, DateTime nextRetryAt})>
+      failedTransitions =
+      <({String operationId, int attemptCount, DateTime nextRetryAt})>[];
+
+  /// Recorded arguments of `markDeadLetter` transitions, in call order.
+  final List<({String operationId, int attemptCount})> deadLetterTransitions =
+      <({String operationId, int attemptCount})>[];
 
   final List<String> inFlightCalls = <String>[];
   final List<String> succeededCalls = <String>[];
@@ -44,6 +65,12 @@ final class FakeLocalStorageAdapter implements LocalStorageAdapter {
 
   /// operationIds for which `markSucceeded` throws.
   final Set<String> markSucceededFailures = <String>{};
+
+  /// operationIds for which `markFailed` throws.
+  final Set<String> markFailedFailures = <String>{};
+
+  /// operationIds for which `markDeadLetter` throws.
+  final Set<String> markDeadLetterFailures = <String>{};
 
   SyncOperationStatus statusOf(String operationId) {
     final op = operations.firstWhere(
@@ -59,7 +86,8 @@ final class FakeLocalStorageAdapter implements LocalStorageAdapter {
       case SyncOperationStatus.pending:
         return true;
       case SyncOperationStatus.failed:
-        final nextRetryAt = op.nextRetryAt;
+        final nextRetryAt =
+            nextRetryAtOverrides[op.operationId] ?? op.nextRetryAt;
         return nextRetryAt == null || !nextRetryAt.isAfter(now);
       case SyncOperationStatus.inFlight:
       case SyncOperationStatus.deadLetter:
@@ -104,9 +132,13 @@ final class FakeLocalStorageAdapter implements LocalStorageAdapter {
   }) async {
     fetchCalls++;
     fetchNows.add(now);
+    fetchLimits.add(limit);
     _events?.add('fetchEligibleOperations');
     if (fetchError != null) {
       throw fetchError!;
+    }
+    if (fetchScript.isNotEmpty) {
+      return fetchScript.removeAt(0);
     }
     return operations
         .where((op) => _isEligible(op, now))
@@ -143,7 +175,16 @@ final class FakeLocalStorageAdapter implements LocalStorageAdapter {
     required SyncError error,
   }) async {
     failedCalls.add(operationId);
+    failedTransitions.add((
+      operationId: operationId,
+      attemptCount: attemptCount,
+      nextRetryAt: nextRetryAt,
+    ));
     _events?.add('markFailed:$operationId');
+    if (markFailedFailures.contains(operationId)) {
+      throw StateError('markFailed storage failure');
+    }
+    nextRetryAtOverrides[operationId] = nextRetryAt;
     _statusOverrides[operationId] = SyncOperationStatus.failed;
   }
 
@@ -154,7 +195,14 @@ final class FakeLocalStorageAdapter implements LocalStorageAdapter {
     required SyncError error,
   }) async {
     deadLetterCalls.add(operationId);
+    deadLetterTransitions.add((
+      operationId: operationId,
+      attemptCount: attemptCount,
+    ));
     _events?.add('markDeadLetter:$operationId');
+    if (markDeadLetterFailures.contains(operationId)) {
+      throw StateError('markDeadLetter storage failure');
+    }
     _statusOverrides[operationId] = SyncOperationStatus.deadLetter;
   }
 
@@ -277,6 +325,8 @@ SyncOperation makeOperation(
   String entityType = 'task',
   String? entityId,
   DateTime? createdAt,
+  int attemptCount = 0,
+  DateTime? nextRetryAt,
 }) =>
     SyncOperation(
       operationId: operationId,
@@ -285,6 +335,8 @@ SyncOperation makeOperation(
       entityId: entityId ?? 'entity-$operationId',
       type: type,
       createdAt: createdAt ?? DateTime.utc(2024, 1, 1),
+      attemptCount: attemptCount,
+      nextRetryAt: nextRetryAt,
       payload: type == SyncOperationType.delete
           ? null
           : <String, dynamic>{'value': operationId},

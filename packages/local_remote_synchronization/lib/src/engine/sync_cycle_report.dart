@@ -69,9 +69,9 @@ final class SyncCycleReport {
 
   /// Cycle-level error that prevented the cycle from completing
   /// normally (e.g., `fetchEligibleOperations` threw, `markInFlight`
-  /// failed, a protocol violation, or an operation-level storage
-  /// failure in Phase 3.1). Null if the cycle completed without
-  /// cycle-level errors.
+  /// failed, or a `RetryPolicy` method threw). Null if the cycle
+  /// completed without cycle-level errors. Operation-level storage
+  /// transition failures are reported via [storageErrors] instead.
   final SyncError? cycleError;
 
   /// Whether the cycle was skipped because the device is offline.
