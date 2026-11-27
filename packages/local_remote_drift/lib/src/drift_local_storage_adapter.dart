@@ -16,9 +16,9 @@ import 'drift_outbox_writer.dart';
 /// (defaulting to `sync_outbox`).
 ///
 /// Drift uses Zone-based transactions (`database.transaction(...)`), so any
-/// domain writes on [database] and calls to [OutboxWriter.enqueue] inside
-/// [runWithTransaction] or [runInTransaction] automatically participate in the
-/// exact same native Drift transaction.
+/// domain writes on the supplied [GeneratedDatabase] and calls to
+/// [OutboxWriter.enqueue] inside [runWithTransaction] or [runInTransaction]
+/// automatically participate in the exact same native Drift transaction.
 final class DriftLocalStorageAdapter implements LocalStorageAdapter {
   /// Creates a [DriftLocalStorageAdapter] using an existing Drift
   /// [database].

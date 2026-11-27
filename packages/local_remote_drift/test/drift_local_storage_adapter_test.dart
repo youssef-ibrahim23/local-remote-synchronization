@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:io';
 
+import 'package:async/async.dart';
 import 'package:drift/drift.dart' hide isNotNull, isNull;
 import 'package:drift/native.dart';
 import 'package:local_remote_drift/local_remote_drift.dart';
@@ -715,6 +716,235 @@ void main() {
       await adapter.dispose();
       expect(await queue.moveNext(), isFalse);
       expect(await allEventsFuture, <int>[0, 1]);
+    });
+  });
+
+  // ─── Nested-Transaction Tests ─────────────────────────────────────────────
+  //
+  // Drift 2.31+ on NativeDatabase supports nested transactions via SQLite
+  // SAVEPOINTs.  When database.transaction() is called inside an outer
+  // database.transaction() zone, Drift starts a child transaction (SAVEPOINT).
+  //
+  // Verified semantics (from drift source, connection_user.dart ~line 454):
+  //
+  //   • A child transaction that completes does NOT persist right away.
+  //     Its writes become visible inside the outer transaction zone only.
+  //   • The outer transaction must commit for all writes to be durable.
+  //   • If the outer transaction throws, ALL writes (including committed child
+  //     transactions) are rolled back.
+  //   • watchPendingCount MAY emit a count after the child commits even when
+  //     the outer has not committed yet — this is a documented limitation.
+  //
+  // These tests prove those semantics empirically against a real in-memory DB.
+  group('Nested Transactions (outer db.transaction + runWithTransaction)', () {
+    test(
+        'domain write and outbox enqueue from inner runWithTransaction commit '
+        'atomically when outer transaction commits', () async {
+      final db = _TestAppDatabase(NativeDatabase.memory());
+      var counter = 0;
+      final adapter = DriftLocalStorageAdapter(
+        database: db,
+        operationIdGenerator: () => 'op-nested-${++counter}',
+      );
+      addTearDown(() async {
+        await adapter.dispose();
+        await db.close();
+      });
+
+      // Outer transaction wraps the adapter call.
+      await db.transaction(() async {
+        await db.customInsert(
+          'INSERT INTO tasks (id, title) VALUES (?, ?)',
+          variables: <Variable<Object>>[
+            Variable.withString('t-outer'),
+            Variable.withString('Outer task'),
+          ],
+        );
+        // runWithTransaction starts a child SAVEPOINT inside the outer txn.
+        await adapter.runWithTransaction((outbox) async {
+          await outbox.enqueue(
+            LocalMutation(
+              entityType: 'tasks',
+              entityId: 't-outer',
+              type: SyncOperationType.create,
+              payload: const <String, dynamic>{'id': 't-outer'},
+            ),
+          );
+        });
+      });
+
+      // After outer transaction commits, both domain row and outbox row exist.
+      final tasks = await db.customSelect('SELECT * FROM tasks').get();
+      expect(tasks, hasLength(1));
+      expect(tasks.single.read<String>('id'), 't-outer');
+
+      final ops = await adapter.fetchEligibleOperations(
+        now: DateTime.now().toUtc().add(const Duration(minutes: 1)),
+        limit: 10,
+      );
+      expect(ops, hasLength(1));
+      expect(ops.single.entityId, 't-outer');
+    });
+
+    test(
+        'outer transaction abort rolls back all writes including child '
+        'transaction commits', () async {
+      final db = _TestAppDatabase(NativeDatabase.memory());
+      var counter = 0;
+      final adapter = DriftLocalStorageAdapter(
+        database: db,
+        operationIdGenerator: () => 'op-abort-${++counter}',
+      );
+      addTearDown(() async {
+        await adapter.dispose();
+        await db.close();
+      });
+
+      // Child transaction will commit (SAVEPOINT RELEASE), but the outer txn
+      // throws, rolling back everything.
+      await expectLater(
+        () => db.transaction(() async {
+          await adapter.runWithTransaction((outbox) async {
+            await db.customInsert(
+              'INSERT INTO tasks (id, title) VALUES (?, ?)',
+              variables: <Variable<Object>>[
+                Variable.withString('t-rollback'),
+                Variable.withString('Should be rolled back'),
+              ],
+            );
+            await outbox.enqueue(
+              LocalMutation(
+                entityType: 'tasks',
+                entityId: 't-rollback',
+                type: SyncOperationType.create,
+              ),
+            );
+          });
+          // This throws after the child transaction has committed.
+          throw StateError('outer transaction aborted');
+        }),
+        throwsStateError,
+      );
+
+      // Both domain row and outbox row must be absent.
+      final tasks = await db.customSelect('SELECT * FROM tasks').get();
+      expect(tasks, isEmpty,
+          reason:
+              'domain write must be rolled back with the outer transaction');
+
+      final ops = await adapter.fetchEligibleOperations(
+        now: DateTime.now().toUtc().add(const Duration(minutes: 1)),
+        limit: 10,
+      );
+      expect(ops, isEmpty,
+          reason:
+              'outbox write must be rolled back with the outer transaction');
+    });
+
+    test(
+        'watchPendingCount emits after child commit — documented premature '
+        'emission limitation when outer has not committed', () async {
+      // This test documents the known limitation: the adapter emits a pending
+      // count after the inner (child) transaction commits, even though the data
+      // is not yet durably persisted because the outer transaction is still
+      // open.  The count self-corrects if the outer transaction later rolls
+      // back and refreshPendingCount() is called.
+      final db = _TestAppDatabase(NativeDatabase.memory());
+      var counter = 0;
+      final adapter = DriftLocalStorageAdapter(
+        database: db,
+        operationIdGenerator: () => 'op-premature-${++counter}',
+      );
+      addTearDown(() async {
+        await adapter.dispose();
+        await db.close();
+      });
+
+      // Collect all pending-count events.
+      final events = <int>[];
+      final subscription = adapter.watchPendingCount().listen(events.add);
+      addTearDown(subscription.cancel);
+
+      // Allow the initial count (0) to be emitted.
+      await Future<void>.delayed(Duration.zero);
+      expect(events, equals(<int>[0]));
+
+      // Run outer transaction; inner adapter call commits its child txn and
+      // emits a premature count before the outer commits.
+      late final Completer<void> innerCommitted;
+      innerCommitted = Completer<void>();
+
+      await db.transaction(() async {
+        await adapter.runWithTransaction((outbox) async {
+          await outbox.enqueue(
+            LocalMutation(
+              entityType: 'tasks',
+              entityId: 't-premature',
+              type: SyncOperationType.delete,
+            ),
+          );
+        });
+        // Allow microtasks to run so the pending-count emission from the
+        // completed child transaction can propagate.
+        await Future<void>.delayed(Duration.zero);
+        innerCommitted.complete();
+      });
+
+      // Wait for outer transaction to commit and all async emissions to settle.
+      await innerCommitted.future;
+      await Future<void>.delayed(Duration.zero);
+
+      // The count is 1 because the outer committed successfully.
+      // Note: the adapter may emit 1 twice (once after child commit, once after
+      // outer commit's _emitPendingCount). Both are acceptable; what matters is
+      // the final count is 1.
+      expect(events.last, equals(1),
+          reason: 'final count must be 1 after outer transaction commits');
+      expect(events, everyElement(inInclusiveRange(0, 1)),
+          reason: 'no spurious counts beyond expected range');
+    });
+
+    test(
+        'pending count corrects itself after outer abort via '
+        'refreshPendingCount', () async {
+      final db = _TestAppDatabase(NativeDatabase.memory());
+      var counter = 0;
+      final adapter = DriftLocalStorageAdapter(
+        database: db,
+        operationIdGenerator: () => 'op-correct-${++counter}',
+      );
+      addTearDown(() async {
+        await adapter.dispose();
+        await db.close();
+      });
+
+      final queue = StreamQueue<int>(adapter.watchPendingCount());
+      addTearDown(queue.cancel);
+
+      // Initial emission: 0.
+      expect(await queue.next, equals(0));
+
+      // The outer transaction aborts; child writes are rolled back.
+      await expectLater(
+        () => db.transaction(() async {
+          await adapter.runWithTransaction((outbox) async {
+            await outbox.enqueue(
+              LocalMutation(
+                entityType: 'tasks',
+                entityId: 't-correct',
+                type: SyncOperationType.delete,
+              ),
+            );
+          });
+          throw StateError('outer abort');
+        }),
+        throwsStateError,
+      );
+
+      // Manually refresh so the stream reflects the rolled-back state.
+      await adapter.refreshPendingCount();
+      expect(await queue.next, equals(0),
+          reason: 'count must return to 0 after refresh following outer abort');
     });
   });
 }

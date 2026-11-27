@@ -1,3 +1,13 @@
 name: local_remote_synchronization_workspace
+publish_to: none
 environment:
-  sdk: ">=3.2.0 <4.0.0"
+  sdk: ">=3.6.0 <4.0.0"
+workspace:
+  - packages/local_remote_synchronization
+  - packages/local_remote_sqflite
+  - packages/local_remote_drift
+  - packages/local_remote_firestore
+  - packages/local_remote_graphql
+  - packages/local_remote_hive
+  - packages/local_remote_rest
+  - packages/local_remote_supabase
