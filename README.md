@@ -121,7 +121,7 @@ local-remote-synchronization/
 
 ### Prerequisites
 
-- Flutter SDK ≥ 3.19.0 (Dart ≥ 3.3.0)
+- Flutter SDK ≥ 3.27.0 (Dart ≥ 3.6.0)
 - [Melos](https://melos.invertase.dev/) — monorepo manager
 
 ### Install Melos
