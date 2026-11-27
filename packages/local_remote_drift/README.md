@@ -4,14 +4,13 @@ A durable outbox adapter for the **local_remote_synchronization** core package, 
 
 ## What it provides
 - Implements the `LocalStorageAdapter` and `OutboxWriter` contracts defined by the core package.
-- Persists outbox operations in the host application's existing Drift database, enabling seamless integration with any existing local schema.
+- Persists outbox operations in the host application's existing Drift database, allowing seamless integration with any existing local schema.
 - Supports:
-  - Transaction‑scoped enqueuing (`outboxFor(transaction)`).
+  - Transaction‑scoped enqueuing (`runWithTransaction`/`runInTransaction`).
   - FIFO per‑entity ordering.
-  - Stable operation IDs and idempotency keys.
-  - Automatic pending‑operation count stream (`watchPendingCount`).
-  - Refresh of pending count after external transactions (`refreshPendingCount`).
-- No dependency on Flutter SDK (pure‑Dart) apart from the optional `sqlite3_flutter_libs` required by Drift on mobile.
+  - Stable operation IDs and idempotency keys (generated automatically).
+  - Reactive pending‑operation count stream (`watchPendingCount`).
+  - Manual `refreshPendingCount()` for external transaction scenarios.
 
 ## Installation
 ```yaml
@@ -28,47 +27,80 @@ import 'package:local_remote_drift/local_remote_drift.dart';
 import 'package:drift/drift.dart';
 import 'package:local_remote_synchronization/local_remote_synchronization.dart';
 
-// Assuming you already have a DriftDatabase `db`.
-final adapter = DriftLocalStorageAdapter(database: db);
-
-await adapter.runWithTransaction((txn) async {
-  // Perform your domain writes using the same transaction.
-  await db.customWrite(...);
-
-  // Enqueue a sync operation atomically.
-  final writer = txn.outbox;
-  await writer.enqueue(SyncOperation(
-    id: const Uuid().v4(),
-    entityType: 'note',
-    entityId: '123',
-    payload: {'title': 'Hello'},
-    // other required fields …
-  ));
+// 1️⃣ Create the application‑owned Drift database.
+// The app owns its domain tables and the lifecycle of the database.
+final db = LazyDatabase(() async {
+  // For example, an in‑memory database for tests or a file‑based one in production.
+  return NativeDatabase.memory();
 });
 
-// Listen for pending‑operation count updates.
-adapter.watchPendingCount().listen((count) {
+// 2️⃣ Initialise the adapter (the outbox schema).
+final adapter = DriftLocalStorageAdapter(database: db);
+await adapter.ensureInitialized(); // safe to call repeatedly
+
+// 3️⃣ Atomically write domain data and enqueue a mutation.
+await adapter.runWithTransaction((outbox) async {
+  // Domain write – any DAO or custom SQL on the same Drift database.
+  await db.customInsert(
+    'INSERT INTO tasks (id, title) VALUES (?, ?)',
+    variables: [Variable.withString('t-1'), Variable.withString('First task')],
+  );
+
+  // Enqueue a local mutation. The adapter generates the operation ID.
+  await outbox.enqueue(
+    LocalMutation(
+      entityType: 'tasks',
+      entityId: 't-1',
+      type: SyncOperationType.create,
+      payload: const { 'title': 'First task' },
+    ),
+  );
+});
+
+// 4️⃣ Using an external (already‑open) transaction.
+await db.transaction(() async {
+  // Domain write inside the external transaction.
+  await db.customInsert(
+    'INSERT INTO tasks (id, title) VALUES (?, ?)',
+    variables: [Variable.withString('t-2'), Variable.withString('Second task')],
+  );
+
+  // Enqueue via the adapter’s `outbox` writer (no new transaction is created).
+  await adapter.outbox.enqueue(
+    LocalMutation(
+      entityType: 'tasks',
+      entityId: 't-2',
+      type: SyncOperationType.create,
+      payload: const { 'title': 'Second task' },
+    ),
+  );
+  // The pending‑count stream is not updated yet because the transaction
+  // hasn't committed. Call `refreshPendingCount()` after the `transaction`
+  // block finishes.
+});
+await adapter.refreshPendingCount(); // Emit the correct pending count.
+
+// 5️⃣ Listening for pending‑operation count changes.
+final subscription = adapter.watchPendingCount().listen((count) {
   print('Pending outbox items: $count');
 });
+
+// 6️⃣ Dispose the adapter when the app shuts down.
+// This closes internal streams but does **not** close the application‑owned
+// Drift database; the app should close the DB itself when appropriate.
+await adapter.dispose();
+await subscription.cancel();
 ```
 
-## API surface
-- `DriftLocalStorageAdapter`
-  - `runWithTransaction`, `runInTransaction`
-  - `outboxFor(Transaction txn)` – returns a writer bound to an existing Drift transaction.
-  - `refreshPendingCount()` – call after an external transaction commits to emit the correct count.
-  - `watchPendingCount()` – broadcast stream of pending operation counts.
-- `DriftOutboxWriter`
-  - `enqueue(SyncOperation operation)` – inserts a new operation and returns the stored instance with a generated sequence number.
+## Schema initialization
+- **New databases** – Call `await adapter.ensureInitialized();` before any outbox work, or integrate `DriftOutboxSchema.createSchema` into your `MigrationStrategy.onCreate`.
+- **Existing databases** – `ensureInitialized()` is safe to call; it creates the outbox table only if it does not already exist, making it suitable for migrations.
 
-## Testing
-The package ships with a full Dart test suite that runs against an in‑memory Drift database. Run the tests with:
-```bash
-melos test -p local_remote_drift
-```
+## When to call `refreshPendingCount()`
+`refreshPendingCount()` is required **only** when you use the `adapter.outbox` writer inside a transaction that you manage yourself (see step 4). The writer cannot emit a count before the surrounding transaction commits, so you manually trigger the refresh after the transaction finishes.
 
-## Contributing
-Feel free to open PRs or issues on the main repository. Follow the contribution guidelines in the root `CONTRIBUTING.md`.
+## Disposal
+The adapter owns only the outbox‑related resources (stream controllers, etc.). It does **not** close the supplied Drift database – the application remains responsible for the database lifecycle.
 
 ---
 *This adapter is part of the **offline‑first synchronization** ecosystem. See the core package README for the overall architecture.*
