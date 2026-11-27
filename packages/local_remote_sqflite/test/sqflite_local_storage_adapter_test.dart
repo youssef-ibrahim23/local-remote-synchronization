@@ -128,7 +128,14 @@ void main() {
       expect(fetched.single, equals(enqueued));
       expect(fetched.single.operationId, 'op-persist-1');
       expect(fetched.single.idempotencyKey, 'custom-idem-1');
+      expect(fetched.single.createdAt, fixedNow);
       expect(fetched.single.createdAt.isUtc, isTrue);
+      expect(fetched.single.occurredAt, occurredLocal.toUtc());
+      expect(fetched.single.occurredAt!.isUtc, isTrue);
+      expect(
+        fetched.single.createdAt,
+        isNot(equals(fetched.single.occurredAt)),
+      );
       expect(fetched.single.sequenceNumber, isNotNull);
     });
 
@@ -371,6 +378,129 @@ void main() {
       await adapter.markSucceeded(op.operationId);
       await Future<void>.delayed(const Duration(milliseconds: 20));
       expect(emitted, <int>[0, 1, 0]);
+    });
+
+    test(
+        'watchPendingCount does not lose updates during initial subscription '
+        'setup and supports multiple listeners', () async {
+      final db = await openTestDb();
+      var counter = 0;
+      final adapter = SqfliteLocalStorageAdapter(
+        database: db,
+        operationIdGenerator: () => 'op-race-${++counter}',
+      );
+      addTearDown(() async {
+        await adapter.dispose();
+        await db.close();
+      });
+
+      final listener1 = <int>[];
+      final listener2 = <int>[];
+
+      // Start listening and immediately enqueue without awaiting initial count
+      // so the mutation races with initial _queryPendingCount().
+      final sub1 = adapter.watchPendingCount().listen(listener1.add);
+      final sub2 = adapter.watchPendingCount().listen(listener2.add);
+      addTearDown(sub1.cancel);
+      addTearDown(sub2.cancel);
+
+      await adapter.runInTransaction(
+        (outbox) => outbox.enqueue(
+          LocalMutation(
+            entityType: 'tasks',
+            entityId: 't-race',
+            type: SyncOperationType.delete,
+          ),
+        ),
+      );
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+
+      // Neither listener may miss 1 or emit a stale 0 after 1.
+      expect(listener1, isNotEmpty);
+      expect(listener1.last, 1);
+      expect(listener2, isNotEmpty);
+      expect(listener2.last, 1);
+    });
+
+    test('failed retry eligibility requires nextRetryAt <= now and non-null',
+        () async {
+      final t0 = DateTime.utc(2026, 6, 1, 10);
+      var counter = 0;
+      final db = await openTestDb();
+      final adapter = SqfliteLocalStorageAdapter(
+        database: db,
+        operationIdGenerator: () => 'op-retry-${++counter}',
+        clock: () => t0,
+      );
+      addTearDown(() async {
+        await adapter.dispose();
+        await db.close();
+      });
+
+      final futureOp = await adapter.runInTransaction(
+        (outbox) => outbox.enqueue(
+          LocalMutation(
+            entityType: 'tasks',
+            entityId: 'future',
+            type: SyncOperationType.delete,
+          ),
+        ),
+      );
+      final pastOp = await adapter.runInTransaction(
+        (outbox) => outbox.enqueue(
+          LocalMutation(
+            entityType: 'tasks',
+            entityId: 'past',
+            type: SyncOperationType.delete,
+          ),
+        ),
+      );
+      final nullRetryOp = await adapter.runInTransaction(
+        (outbox) => outbox.enqueue(
+          LocalMutation(
+            entityType: 'tasks',
+            entityId: 'null-retry',
+            type: SyncOperationType.delete,
+          ),
+        ),
+      );
+
+      final err = SyncError(
+        code: SyncErrorCode.network,
+        message: 'Timeout',
+        isRetryable: true,
+      );
+
+      await adapter.markFailed(
+        futureOp.operationId,
+        attemptCount: 1,
+        nextRetryAt: t0.add(const Duration(minutes: 5)),
+        error: err,
+      );
+      await adapter.markFailed(
+        pastOp.operationId,
+        attemptCount: 1,
+        nextRetryAt: t0.subtract(const Duration(seconds: 1)),
+        error: err,
+      );
+      // Force failed status with NULL next_retry_at_ms.
+      await db.rawUpdate(
+        '''
+        UPDATE sync_outbox
+        SET status = 'failed', next_retry_at_ms = NULL
+        WHERE operation_id = ?
+        ''',
+        <Object?>[nullRetryOp.operationId],
+      );
+
+      final eligible = await adapter.fetchEligibleOperations(
+        now: t0,
+        limit: 10,
+      );
+      expect(
+        eligible.map((o) => o.operationId),
+        <String>[pastOp.operationId],
+      );
     });
   });
 

@@ -33,7 +33,6 @@ final class SqfliteOutboxWriter implements OutboxWriter {
 
     final row = SqfliteOutboxMapper.toInsertRow(
       initial,
-      occurredAt: mutation.occurredAt,
       updatedAt: now,
     );
 

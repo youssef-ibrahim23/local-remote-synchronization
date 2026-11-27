@@ -9,7 +9,6 @@ final class SqfliteOutboxMapper {
   /// Converts [operation] into a parameterized SQLite insert map.
   static Map<String, Object?> toInsertRow(
     SyncOperation operation, {
-    required DateTime? occurredAt,
     required DateTime updatedAt,
   }) =>
       <String, Object?>{
@@ -24,7 +23,7 @@ final class SqfliteOutboxMapper {
         'status': operation.status.name,
         'attempt_count': operation.attemptCount,
         'created_at_ms': operation.createdAt.toUtc().millisecondsSinceEpoch,
-        'occurred_at_ms': occurredAt?.toUtc().millisecondsSinceEpoch,
+        'occurred_at_ms': operation.occurredAt?.toUtc().millisecondsSinceEpoch,
         'updated_at_ms': updatedAt.toUtc().millisecondsSinceEpoch,
         'next_retry_at_ms':
             operation.nextRetryAt?.toUtc().millisecondsSinceEpoch,
@@ -54,6 +53,7 @@ final class SqfliteOutboxMapper {
       final metadataJson = _requireString(row, 'metadata_json');
       final attemptCount = _requireInt(row, 'attempt_count');
       final createdAtMs = _requireInt(row, 'created_at_ms');
+      final occurredAtMs = _optionalInt(row, 'occurred_at_ms');
       final sequenceNumber = _optionalInt(row, 'sequence_number');
       final nextRetryAtMs = _optionalInt(row, 'next_retry_at_ms');
       final payloadJson = _optionalString(row, 'payload_json');
@@ -86,6 +86,12 @@ final class SqfliteOutboxMapper {
           createdAtMs,
           isUtc: true,
         ),
+        occurredAt: occurredAtMs == null
+            ? null
+            : DateTime.fromMillisecondsSinceEpoch(
+                occurredAtMs,
+                isUtc: true,
+              ),
         payload: payload,
         metadata: metadata,
         status: status,

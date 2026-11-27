@@ -41,6 +41,7 @@ final class SqfliteLocalStorageAdapter implements LocalStorageAdapter {
   final DateTime Function() _clock;
   final StreamController<int> _pendingCountController =
       StreamController<int>.broadcast();
+  int _pendingCountVersion = 0;
   bool _disposed = false;
 
   /// Creates the outbox table and indexes if they do not already exist.
@@ -134,7 +135,8 @@ final class SqfliteLocalStorageAdapter implements LocalStorageAdapter {
         o.status = ?
         OR (
           o.status = ?
-          AND (o.next_retry_at_ms IS NULL OR o.next_retry_at_ms <= ?)
+          AND o.next_retry_at_ms IS NOT NULL
+          AND o.next_retry_at_ms <= ?
         )
       )
       $perEntityFilter
@@ -242,24 +244,43 @@ final class SqfliteLocalStorageAdapter implements LocalStorageAdapter {
   Stream<int> watchPendingCount() {
     late final StreamController<int> controller;
     StreamSubscription<int>? subscription;
+    var receivedLiveUpdate = false;
 
     controller = StreamController<int>(
       onListen: () async {
+        if (_disposed) {
+          await controller.close();
+          return;
+        }
+
+        // Subscribe before querying the initial count so concurrent mutations
+        // during subscription setup are never lost.
+        subscription = _pendingCountController.stream.listen(
+          (count) {
+            receivedLiveUpdate = true;
+            if (!controller.isClosed) {
+              controller.add(count);
+            }
+          },
+          onError: (Object error, StackTrace stackTrace) {
+            if (!controller.isClosed) {
+              controller.addError(error, stackTrace);
+            }
+          },
+        );
+
+        final initialVersion = _pendingCountVersion;
         try {
           final initialCount = await _queryPendingCount();
-          if (!controller.isClosed) {
+          if (!controller.isClosed &&
+              !receivedLiveUpdate &&
+              initialVersion == _pendingCountVersion) {
             controller.add(initialCount);
           }
         } catch (error, stackTrace) {
           if (!controller.isClosed) {
             controller.addError(error, stackTrace);
           }
-        }
-        if (!_disposed && !controller.isClosed) {
-          subscription = _pendingCountController.stream.listen(
-            controller.add,
-            onError: controller.addError,
-          );
         }
       },
       onCancel: () async {
@@ -291,12 +312,15 @@ final class SqfliteLocalStorageAdapter implements LocalStorageAdapter {
   }
 
   Future<void> _emitPendingCount() async {
+    final version = ++_pendingCountVersion;
     if (_disposed || !_pendingCountController.hasListener) {
       return;
     }
     try {
       final count = await _queryPendingCount();
-      if (!_disposed && !_pendingCountController.isClosed) {
+      if (!_disposed &&
+          !_pendingCountController.isClosed &&
+          version == _pendingCountVersion) {
         _pendingCountController.add(count);
       }
     } on DatabaseException {

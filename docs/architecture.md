@@ -13,31 +13,29 @@ adapter package that depends on the Core — never the other way around.
 
 ```
  ┌─────────────────────────────────────────────────┐
- │                  Flutter App                    │
- │  Reads from local storage only.                 │
- │  Writes locally first, then sync fires.         │
+ │             Application (Flutter / Dart)        │
+ │  Owns local domain tables & typed DAOs.         │
+ │  Persists domain writes + outbox atomically.    │
  └───────────────────┬─────────────────────────────┘
                      │  depends on
  ┌───────────────────▼─────────────────────────────┐
- │       local_remote_synchronization (Core)        │
+ │       local_remote_synchronization (Core)       │
+ │                 (Pure Dart)                     │
  │                                                 │
- │  Contracts: LocalStorageAdapter                 │
- │             RemoteSyncAdapter                   │
- │             ConnectivityProvider                │
- │             ConflictResolver                    │
- │             RetryPolicy                         │
+ │  Phase 1 (Implemented):                         │
+ │    Contracts: LocalStorageAdapter, OutboxWriter,│
+ │               RemoteSyncAdapter,                │
+ │               ConnectivityProvider              │
+ │    Models:    SyncOperation, LocalMutation,     │
+ │               SyncResult, SyncError             │
  │                                                 │
- │  Models:    SyncOperation, LocalMutation,       │
- │             SyncResult, SyncStatus,             │
- │             SyncConfiguration, SyncError        │
- │                                                 │
- │  Engine:    SyncEngine (skeleton)               │
- │  Queue:     SyncQueue (abstraction)             │
- │  Scheduler: SyncScheduler (skeleton)            │
+ │  Planned (Future Phases):                       │
+ │    SyncEngine, RetryPolicy, ConflictResolver    │
  └──────┬──────────────────────────────┬───────────┘
         │  implements                  │  implements
  ┌──────▼──────────┐         ┌─────────▼──────────────────────┐
  │  Local Adapters │         │  Remote Adapters               │
+ │  (Independent)  │         │  (Independent)                 │
  │                 │         │                                │
  │ local_remote_   │         │ local_remote_supabase          │
  │   sqflite       │         │ local_remote_firestore         │
@@ -45,12 +43,16 @@ adapter package that depends on the Core — never the other way around.
  │   drift         │         │ local_remote_graphql           │
  │ local_remote_   │         │                                │
  │   hive          │         └────────────────────────────────┘
- └─────────────────┘
-   LocalStorageAdapter          RemoteSyncAdapter
+ └─────────────────┘            RemoteSyncAdapter
+   LocalStorageAdapter
+   (Each adapter persists its own Outbox in its chosen DB)
 ```
 
 **Rule:** Arrows flow from dependent → dependency.
 Adapters depend on Core; Core depends on nothing domain-specific.
+Each local adapter (`local_remote_sqflite`, `local_remote_drift`,
+`local_remote_hive`) is independent and persists its own durable Outbox using
+the same database technology selected by the application.
 
 ---
 
@@ -58,11 +60,9 @@ Adapters depend on Core; Core depends on nothing domain-specific.
 
 ### Core (`local_remote_synchronization`)
 
-**Allowed dependencies:**
-- `flutter` SDK
+**Allowed dependencies (Pure Dart):**
 - `meta` (annotations)
-- `collection` (utilities)
-- `equatable` (value equality)
+- `collection` (deep collection equality and utilities)
 
 **Forbidden dependencies (forever):**
 - Any database package (sqflite, Drift, Hive, Realm, …)
@@ -96,31 +96,26 @@ Adapters depend on Core; Core depends on nothing domain-specific.
 
 ---
 
-## Data Flow
+## Target Data Flow (Future Engine Orchestration)
+
+> **Note:** `SyncEngine`, `RetryPolicy`, and `ConflictResolver` are planned for
+> subsequent phases and are not yet implemented in Core.
 
 ```
 User Action
     │
     ▼
-Write to Local DB (via LocalStorageAdapter)
+Atomic Local Write + Outbox Enqueue (via LocalStorageAdapter / typed txn API)
     │
     ▼
-Enqueue SyncOperation in SyncQueue (durable, survives restarts)
-    │
-    ▼
-SyncEngine observes queue + ConnectivityProvider
-    │
-    ▼
-SyncProcessor picks next operation
+SyncEngine (planned) observes Outbox + ConnectivityProvider
     │
     ▼
 Apply operation via RemoteSyncAdapter
     │
-    ├─── Success ──► Dequeue + mark SyncResult.success
+    ├─── Success ──► markSucceeded
     │
-    └─── Failure ──► RetryPolicy decides backoff / abandon
-                         │
-                         └── ConflictResolver if conflict detected
+    └─── Failure ──► RetryPolicy (planned) / ConflictResolver (planned)
 ```
 
 ---
