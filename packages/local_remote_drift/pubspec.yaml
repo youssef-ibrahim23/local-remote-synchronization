@@ -10,7 +10,7 @@ repository: https://github.com/youssef-ibrahim23/local-remote-synchronization
 issue_tracker: https://github.com/youssef-ibrahim23/local-remote-synchronization/issues
 
 environment:
-  sdk: ">=3.3.0 <4.0.0"
+  sdk: ">=3.5.0 <4.0.0"
 
 dependencies:
   drift: ^2.31.0
