@@ -2654,7 +2654,10 @@ failure reporting, and retry-policy exception semantics.
 - **Basic Phase 3.1 fetch-time semantics:** each fetch samples
   `clock.now()` independently; no cycle-wide cutoff exists yet.
 - Same-cycle retry prevention (fixed eligibility cutoff) — Phase 3.2;
-  verify that the captured cycle-start cutoff is reused for every fetch.
+  verify that the exact cycle-start timestamp is passed to every fetch,
+  even when the clock advances between batch iterations, and that an
+  operation becoming eligible after that cutoff is not fetched again
+  in the same cycle.
 - **Operation-level storage failure reporting (Phase 3.2):**
   `markSucceeded`/`markFailed`/`markDeadLetter` throwing →
   `storageErrors++`, `isSuccess == false`, persisted state unknown.
