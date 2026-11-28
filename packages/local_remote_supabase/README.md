@@ -244,7 +244,37 @@ idempotency and version columns.
 ## Testing
 
 Unit tests run against a fake `http.Client` injected through
-`SupabaseClient(httpClient:)` — no live Supabase project required.
+`SupabaseClient(httpClient:)` — no live Supabase project required. They
+verify the adapter's request/response contract (conditional filters,
+idempotency checks, error mapping) but **cannot** prove database
+behavior.
+
+### PostgreSQL version-trigger integration test
+
+Version progression is the database's responsibility: the adapter issues
+conditional `WHERE version = expected` writes but never increments the
+column itself — the documented `BEFORE UPDATE` trigger does. The
+conditional PATCH therefore only protects against stale writes **when
+the version column is correctly maintained** by such a trigger (or an
+equivalent server-side mechanism).
+
+`test/integration/version_trigger_integration_test.dart` verifies the
+real PostgreSQL behavior — version increment on actual update, no
+increment on no-op writes, and rejection of stale conditional updates —
+against a plain PostgreSQL server (no Supabase project needed).
+
+It is **opt-in and skipped by default**. To run it, point
+`SUPABASE_ADAPTER_TEST_DATABASE_URL` at any reachable PostgreSQL
+database:
+
+```bash
+export SUPABASE_ADAPTER_TEST_DATABASE_URL="postgresql://user:pass@localhost:5432/postgres"
+flutter test packages/local_remote_supabase
+```
+
+The test creates a uniquely named table and trigger function and drops
+them afterwards; it never touches application tables and requires no
+credentials beyond the connection string.
 
 ## License
 
