@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:math' as math;
 
 import 'package:meta/meta.dart';
@@ -28,8 +29,11 @@ part 'sync_cycle_report.dart';
 /// cutoff, and same-cycle attempt deduplication.
 ///
 /// Phase 3.3 scope adds [conflicts] broadcast stream and durable conflict
-/// transition through [LocalStorageAdapter.markDeadLetter]. Per-entity
-/// ordering guards are added in Phase 3.4.
+/// transition through [LocalStorageAdapter.markDeadLetter].
+///
+/// Phase 3.4 scope adds the engine-level per-entity ordering guard:
+/// collision-safe entity keys, group-sort-select of the earliest
+/// operation per entity, and cycle-scoped entity blocking.
 final class SyncEngine {
   /// Creates a [SyncEngine] with the given adapters and configuration.
   ///
@@ -361,6 +365,21 @@ final class SyncEngine {
     // entirely already-attempted terminate the loop safely.
     final attemptedOperationIds = <String>{};
 
+    // Phase 3.4: entities blocked for the remainder of this cycle after
+    // any outcome other than a successfully persisted markSucceeded
+    // (failure, conflict, dead-letter, protocol violation, or an
+    // unknown-state storage transition). Keyed by the collision-safe
+    // jsonEncode entity key. Created once per cycle and never cleared
+    // between batch fetches.
+    final entityBlocked = <String>{};
+
+    // Phase 3.4: operationIds already skipped because their entity is
+    // blocked. If a fetched batch consists entirely of previously
+    // skipped ids, no progress is possible and the cycle ends — this
+    // prevents an infinite fetch loop when an adapter keeps returning
+    // operations for blocked entities.
+    final blockedSkippedIds = <String>{};
+
     while (true) {
       // Phase 3.2: every fetch uses the same immutable eligibility
       // cutoff captured at cycle start.
@@ -405,11 +424,49 @@ final class SyncEngine {
         return;
       }
 
+      // Phase 3.4: per-entity ordering guard. Group the deduplicated
+      // operations by collision-safe entity key, skip entities already
+      // blocked this cycle, sort each group by
+      // (sequenceNumber ?? 0, createdAt, operationId), and select only
+      // the earliest operation per entity. Unselected operations are
+      // NOT marked attempted and are NOT discarded — they remain
+      // eligible for later fetches in this cycle.
+      final byEntity = <String, List<SyncOperation>>{};
+      var hasNewBlocked = false;
+      for (final op in operations) {
+        final key = _entityKey(op);
+        if (entityBlocked.contains(key)) {
+          if (blockedSkippedIds.add(op.operationId)) {
+            hasNewBlocked = true;
+          }
+          continue;
+        }
+        byEntity.putIfAbsent(key, () => <SyncOperation>[]).add(op);
+      }
+
+      final selectedOps = <SyncOperation>[];
+      for (final group in byEntity.values) {
+        group.sort(_compareEntityOperations);
+        selectedOps.add(group.first);
+      }
+
+      if (selectedOps.isEmpty) {
+        // Nothing selectable this pass. If every blocked operation was
+        // already seen, the adapter will keep returning the same
+        // unselectable operations — end the cycle. Otherwise give the
+        // adapter another fetch; it may return different operations.
+        if (!hasNewBlocked) {
+          return;
+        }
+        continue;
+      }
+
       for (var start = 0;
-          start < operations.length;
+          start < selectedOps.length;
           start += _config.maxConcurrency) {
-        final end = math.min(start + _config.maxConcurrency, operations.length);
-        final chunk = operations.sublist(start, end);
+        final end =
+            math.min(start + _config.maxConcurrency, selectedOps.length);
+        final chunk = selectedOps.sublist(start, end);
 
         // Claim ALL operations in the chunk BEFORE any push begins.
         // If any markInFlight fails, abort the cycle — no push in this
@@ -443,7 +500,7 @@ final class SyncEngine {
         // Future.wait waits for the whole chunk to settle before the
         // error reaches the cycle boundary.
         await Future.wait(
-          claimed.map((op) => _pushAndHandle(op, accumulator)),
+          claimed.map((op) => _pushAndHandle(op, accumulator, entityBlocked)),
         );
       }
 
@@ -459,7 +516,10 @@ final class SyncEngine {
   Future<void> _pushAndHandle(
     SyncOperation op,
     _CycleAccumulator accumulator,
+    Set<String> entityBlocked,
   ) async {
+    // Phase 3.4: collision-safe entity key for cycle-scoped blocking.
+    final entityKey = _entityKey(op);
     SyncResult result;
     try {
       result = await _remoteSync.push(op);
@@ -484,6 +544,9 @@ final class SyncEngine {
     // it throws. The cycle is NOT aborted for this operation-level
     // outcome.
     if (result.operationId != op.operationId) {
+      // Phase 3.4: protocol violation blocks the entity for the rest of
+      // the cycle regardless of the storage transition outcome.
+      entityBlocked.add(entityKey);
       final error = SyncError(
         code: SyncErrorCode.unknown,
         message: 'Protocol violation: result.operationId '
@@ -515,6 +578,9 @@ final class SyncEngine {
         // is UNKNOWN — it may be inFlight, pending, or already removed.
         // The cycle continues; no outcome counter is incremented.
         accumulator.storageErrors++;
+        // Phase 3.4: unknown persisted state — block the entity for the
+        // rest of the cycle.
+        entityBlocked.add(entityKey);
       }
       return;
     }
@@ -528,6 +594,10 @@ final class SyncEngine {
         message: 'Remote conflict: ${result.remoteVersion ?? "unknown"}',
         isRetryable: false,
       );
+      // Phase 3.4: block the entity for the rest of the cycle — added
+      // before the storage attempt so the entity stays blocked even if
+      // markDeadLetter throws and the persisted state is unknown.
+      entityBlocked.add(entityKey);
       // Step 1: Persist before notification. The storage try/catch is
       // limited to markDeadLetter so that a persistence failure counts
       // as storageErrors and never as conflicted or deadLettered.
@@ -565,6 +635,13 @@ final class SyncEngine {
     final error = (result as SyncFailure).error;
     final newAttemptCount = op.attemptCount + 1;
 
+    // Phase 3.4: any failure outcome blocks the entity for the rest of
+    // the cycle — whether it is retried, dead-lettered, or its storage
+    // transition fails (persisted state unknown). Added before the
+    // policy calls so the block also applies if a policy method throws
+    // and the cycle aborts.
+    entityBlocked.add(entityKey);
+
     // Policy calls are intentionally NOT wrapped: a throw propagates
     // through Future.wait (which lets the rest of the chunk settle)
     // to the cycle error boundary. No transition is applied and no
@@ -595,6 +672,36 @@ final class SyncEngine {
       }
     }
   }
+}
+
+/// Phase 3.4: collision-safe entity key for the per-entity ordering
+/// guard and cycle-scoped entity blocking.
+///
+/// `jsonEncode` produces a canonical encoding, so entity pairs are
+/// distinct even when `entityType` or `entityId` contain delimiter
+/// characters such as `:` — unlike a `'${entityType}:${entityId}'`
+/// concatenation, which would collide for `('a:b', 'c')` vs `('a', 'b:c')`.
+String _entityKey(SyncOperation operation) =>
+    jsonEncode(<String>[operation.entityType, operation.entityId]);
+
+/// Phase 3.4: deterministic per-entity ordering used to select the
+/// earliest operation within an entity group.
+///
+/// Orders by `sequenceNumber` ascending (null treated as `0`, matching
+/// the documented engine tiebreak and the Hive adapter's `?? 0`
+/// fallback), then `createdAt` ascending, then `operationId` ascending
+/// as the final deterministic tiebreak.
+int _compareEntityOperations(SyncOperation a, SyncOperation b) {
+  final seqA = a.sequenceNumber ?? 0;
+  final seqB = b.sequenceNumber ?? 0;
+  if (seqA != seqB) {
+    return seqA.compareTo(seqB);
+  }
+  final createdCompare = a.createdAt.compareTo(b.createdAt);
+  if (createdCompare != 0) {
+    return createdCompare;
+  }
+  return a.operationId.compareTo(b.operationId);
 }
 
 /// Private reservation token for the single-flight cycle.

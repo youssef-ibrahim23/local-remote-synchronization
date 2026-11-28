@@ -326,6 +326,7 @@ SyncOperation makeOperation(
   String? entityId,
   DateTime? createdAt,
   int attemptCount = 0,
+  int? sequenceNumber,
   DateTime? nextRetryAt,
 }) =>
     SyncOperation(
@@ -336,6 +337,7 @@ SyncOperation makeOperation(
       type: type,
       createdAt: createdAt ?? DateTime.utc(2024, 1, 1),
       attemptCount: attemptCount,
+      sequenceNumber: sequenceNumber,
       nextRetryAt: nextRetryAt,
       payload: type == SyncOperationType.delete
           ? null
