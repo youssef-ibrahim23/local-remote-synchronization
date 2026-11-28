@@ -242,6 +242,16 @@ void main() {
       expect(harness.http.requests, isEmpty);
     });
 
+    test('null payload cannot reach the adapter (Core invariant)', () {
+      // SyncOperation's constructor requires a payload for create and
+      // update operations, so _writePayload's null guard is
+      // unreachable defense-in-depth: it throws SyncValidationException,
+      // which SupabaseErrorMapper maps to a non-retryable validation
+      // SyncFailure (covered by the mapper tests).
+      expect(makeOperation, throwsArgumentError);
+      expect(harness.http.requests, isEmpty);
+    });
+
     test('duplicate PK with matching idempotency key returns success',
         () async {
       harness.http
@@ -493,6 +503,17 @@ void main() {
         ),
       );
       expect(result, isA<SyncFailure>());
+      expect(harness.http.requests, isEmpty);
+    });
+
+    test('null payload cannot reach the adapter (Core invariant)', () {
+      // Same Core-level invariant as create: a null-payload update
+      // operation cannot be constructed, so the adapter's
+      // SyncValidationException guard is defense-in-depth only.
+      expect(
+        () => makeOperation(type: SyncOperationType.update),
+        throwsArgumentError,
+      );
       expect(harness.http.requests, isEmpty);
     });
   });

@@ -328,7 +328,7 @@ final class SupabaseRemoteSyncAdapter implements RemoteSyncAdapter {
   ) {
     final payload = operation.payload;
     if (payload == null) {
-      throw ArgumentError(
+      throw SyncValidationException(
         'Payload is required for ${operation.type.name} operations.',
       );
     }
