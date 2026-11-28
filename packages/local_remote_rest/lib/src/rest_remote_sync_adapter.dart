@@ -108,11 +108,15 @@ final class RestRemoteSyncAdapter implements RemoteSyncAdapter {
     final uri = Uri.tryParse(baseUrl.trim());
     if (uri == null ||
         (uri.scheme != 'http' && uri.scheme != 'https') ||
-        uri.host.isEmpty) {
+        uri.host.isEmpty ||
+        uri.userInfo.isNotEmpty ||
+        uri.hasQuery ||
+        uri.hasFragment) {
       throw ArgumentError.value(
         baseUrl,
         'baseUrl',
-        'Must be an absolute http:// or https:// URI.',
+        'Must be an absolute http:// or https:// URI without '
+            'credentials, query parameters, or fragments.',
       );
     }
     var path = uri.path;
@@ -311,7 +315,20 @@ final class RestRemoteSyncAdapter implements RemoteSyncAdapter {
       headers['Content-Type'] = 'application/json';
     }
 
-    final request = http.Request(method, uri)..headers.addAll(headers);
+    // AbortableRequest lets supporting clients (IOClient, BrowserClient)
+    // cancel the in-flight request when abortTrigger completes. Clients
+    // that do not support abortion simply ignore the trigger; the
+    // deadline-based timeouts below still guarantee push() completes.
+    final abort = Completer<void>();
+    void abortRequest() {
+      if (!abort.isCompleted) abort.complete();
+    }
+
+    final request = http.AbortableRequest(
+      method,
+      uri,
+      abortTrigger: abort.future,
+    )..headers.addAll(headers);
     if (body != null) {
       // bodyBytes (unlike body) never overrides the Content-Type header.
       request.bodyBytes = Uint8List.fromList(
@@ -331,13 +348,17 @@ final class RestRemoteSyncAdapter implements RemoteSyncAdapter {
           'Request to $method $uri exceeded $requestTimeout',
         );
 
-    final streamed = await _client
-        .send(request)
-        .timeout(remaining(), onTimeout: () => throw timeoutError());
+    final streamed = await _client.send(request).timeout(
+      remaining(),
+      onTimeout: () {
+        abortRequest();
+        throw timeoutError();
+      },
+    );
 
-    // Consume the body manually so the subscription can be cancelled when
-    // the deadline expires — http.Response.fromStream offers no way to
-    // abort an in-flight body read.
+    // Consume the body manually so the subscription can be cancelled
+    // when the deadline expires — http.Response.fromStream offers no
+    // way to abort an in-flight body read.
     final buffer = BytesBuilder();
     final completed = Completer<void>();
     late StreamSubscription<List<int>> subscription;
@@ -351,6 +372,7 @@ final class RestRemoteSyncAdapter implements RemoteSyncAdapter {
       await completed.future.timeout(
         remaining(),
         onTimeout: () async {
+          abortRequest();
           await subscription.cancel();
           throw timeoutError();
         },

@@ -11,12 +11,17 @@ final class RecordedRequest {
     required this.url,
     required this.headers,
     required this.body,
+    required this.abortable,
   });
 
   final String method;
   final Uri url;
   final Map<String, String> headers;
   final String body;
+
+  /// Whether the request was an `http.AbortableRequest` carrying an
+  /// `abortTrigger` the adapter could complete on timeout.
+  final bool abortable;
 
   Map<String, dynamic>? get jsonBody =>
       body.isEmpty ? null : jsonDecode(body) as Map<String, dynamic>?;
@@ -37,6 +42,10 @@ final class FakeHttpClient extends http.BaseClient {
   /// Whether [close] was called on this client.
   bool get isClosed => _isClosed;
   bool _isClosed = false;
+
+  /// URLs whose `abortTrigger` completed — proves the adapter aborted
+  /// the request on timeout.
+  final List<Uri> abortedRequests = [];
 
   @override
   void close() {
@@ -95,6 +104,14 @@ final class FakeHttpClient extends http.BaseClient {
 
   @override
   Future<http.StreamedResponse> send(http.BaseRequest request) async {
+    final abortable = request is http.Abortable;
+    if (abortable) {
+      unawaited(
+        request.abortTrigger!.whenComplete(() {
+          abortedRequests.add(request.url);
+        }),
+      );
+    }
     final bodyBytes = await request.finalize().toBytes();
     requests.add(
       RecordedRequest(
@@ -107,6 +124,7 @@ final class FakeHttpClient extends http.BaseClient {
             entry.key.toLowerCase(): entry.value,
         },
         body: utf8.decode(bodyBytes),
+        abortable: abortable,
       ),
     );
 

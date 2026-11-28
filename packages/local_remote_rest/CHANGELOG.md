@@ -22,4 +22,7 @@
   the configured origin; dot-only entity IDs are rejected safely.
 - `requestTimeout` now covers the entire HTTP operation including body
   consumption, is validated as a positive duration at construction, and
-  cancels stalled body subscriptions on timeout.
+  on expiry actively aborts the request via `http.AbortableRequest`'s
+  `abortTrigger` where the HTTP client supports it.
+- `baseUrl` is strictly validated: rejects non-HTTP(S) schemes, missing
+  hosts, embedded credentials, query parameters, and fragments.

@@ -41,6 +41,20 @@ abstract final class RestErrorMapper {
         stackTrace: stackTrace,
       );
     }
+    // RequestAbortedException is only produced by our own abortTrigger,
+    // which fires exclusively when the request deadline expires — it must
+    // be classified as a timeout, not a generic network failure, even
+    // though it extends ClientException.
+    if (error is http.RequestAbortedException) {
+      return _failure(
+        operation,
+        code: SyncErrorCode.timeout,
+        message: 'Request aborted after exceeding the configured timeout.',
+        isRetryable: true,
+        cause: error,
+        stackTrace: stackTrace,
+      );
+    }
     if (error is http.ClientException) {
       return _failure(
         operation,

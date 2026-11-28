@@ -49,7 +49,8 @@ import 'package:local_remote_rest/local_remote_rest.dart';
 import 'package:local_remote_synchronization/local_remote_synchronization.dart';
 
 final adapter = RestRemoteSyncAdapter(
-  baseUrl: 'https://api.example.com/v1/',
+  baseUrl: 'https://api.example.com/v1/', // absolute http(s) only:
+  // no credentials, query, or fragment; relative URLs rejected
   entityMapping: {
     'note': RestEntityConfig(collectionPath: 'notes'),
     'todo': RestEntityConfig(
@@ -217,8 +218,15 @@ errors propagate rather than being disguised as network failures.
 - Each request is bounded by `requestTimeout` (default 30s, must be a
   positive `Duration`). The deadline covers the **entire** operation:
   sending the request, receiving response headers, and consuming the full
-  response body. A stalled body stream times out and its subscription is
-  cancelled.
+  response body. On expiry the adapter activates the request's
+  `abortTrigger` (`http.AbortableRequest`), so clients that support
+  abortion (e.g. `IOClient`, `BrowserClient`) cancel the in-flight HTTP
+  request; the body subscription is always cancelled locally regardless.
+  Aborting the client-side request does **not** guarantee the server did
+  not already process it — delivery remains at-least-once and backend
+  idempotency support is still required. Injected `http.Client`
+  implementations that do not honor `AbortableRequest` simply ignore the
+  trigger; the deadline still guarantees `push()` completes.
 
 ---
 

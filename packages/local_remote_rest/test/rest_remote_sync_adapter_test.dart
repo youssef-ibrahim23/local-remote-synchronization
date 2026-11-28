@@ -61,6 +61,67 @@ void main() {
       );
     });
 
+    test('rejects baseUrl with embedded credentials', () {
+      expect(
+        () => RestRemoteSyncAdapter(
+          baseUrl: 'https://user:pass@api.example.com',
+          entityMapping: {
+            'note': RestEntityConfig(collectionPath: 'notes'),
+          },
+        ),
+        throwsArgumentError,
+      );
+    });
+
+    test('rejects baseUrl with query or fragment', () {
+      for (final url in [
+        'https://api.example.com?token=abc',
+        'https://api.example.com/v1/?x=1',
+        'https://api.example.com#frag',
+      ]) {
+        expect(
+          () => RestRemoteSyncAdapter(
+            baseUrl: url,
+            entityMapping: {
+              'note': RestEntityConfig(collectionPath: 'notes'),
+            },
+          ),
+          throwsArgumentError,
+          reason: url,
+        );
+      }
+    });
+
+    test('rejects relative baseUrl', () {
+      expect(
+        () => RestRemoteSyncAdapter(
+          baseUrl: 'api.example.com/v1',
+          entityMapping: {
+            'note': RestEntityConfig(collectionPath: 'notes'),
+          },
+        ),
+        throwsArgumentError,
+      );
+    });
+
+    test('accepts valid baseUrl variants', () {
+      for (final url in [
+        'http://api.example.com',
+        'https://api.example.com',
+        'https://api.example.com:8443',
+        'https://api.example.com/v1/',
+        'https://api.example.com/v1',
+      ]) {
+        final adapter = RestRemoteSyncAdapter(
+          baseUrl: url,
+          entityMapping: {
+            'note': RestEntityConfig(collectionPath: 'notes'),
+          },
+        );
+        addTearDown(adapter.close);
+      }
+    });
+
     test('mapping is snapshotted at construction', () async {
       final mapping = <String, RestEntityConfig>{
         'note': RestEntityConfig(collectionPath: 'notes'),
@@ -628,6 +689,26 @@ void main() {
       expect(failure.error.isRetryable, isTrue);
     });
 
+    test('timeout before headers sends an abortable request and aborts it',
+        () async {
+      final h = RestTestHarness.create(
+        requestTimeout: const Duration(milliseconds: 50),
+      );
+      addTearDown(h.dispose);
+      h.http.pending = Completer<void>().future;
+
+      final failure = (await h.adapter.push(
+        makeOperation(payload: {}),
+      )) as SyncFailure;
+
+      expect(failure.error.code, SyncErrorCode.timeout);
+      expect(failure.error.isRetryable, isTrue);
+      // The adapter sent an AbortableRequest and activated its trigger.
+      expect(h.http.requests.single.abortable, isTrue);
+      await pumpEventQueue();
+      expect(h.http.abortedRequests, hasLength(1));
+    });
+
     test('response body that never completes times out', () async {
       final h = RestTestHarness.create(
         requestTimeout: const Duration(milliseconds: 50),
@@ -642,6 +723,23 @@ void main() {
       expect(failure.error.code, SyncErrorCode.timeout);
       expect(failure.error.isRetryable, isTrue);
       expect(failure.operationId, 'op-1');
+      // The abort trigger fired and the body subscription was cancelled
+      // (the pending stream never completes, so only the adapter-side
+      // timeout could have ended the wait).
+      expect(h.http.requests.single.abortable, isTrue);
+      await pumpEventQueue();
+      expect(h.http.abortedRequests, hasLength(1));
+    });
+
+    test('successful requests are not aborted', () async {
+      harness.http.enqueueJson(200, {'id': 'entity-1'});
+      final result = await harness.adapter.push(
+        makeOperation(payload: {'title': 'x'}),
+      );
+
+      expect(result, isA<SyncSuccess>());
+      expect(harness.http.requests.single.abortable, isTrue);
+      expect(harness.http.abortedRequests, isEmpty);
     });
 
     test('every failure preserves the operation id', () async {

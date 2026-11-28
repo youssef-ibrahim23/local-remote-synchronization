@@ -16,7 +16,7 @@ environment:
 dependencies:
   local_remote_synchronization:
     path: ../local_remote_synchronization
-  http: ^1.3.0
+  http: ^1.5.0
 
 dev_dependencies:
   flutter_test:
