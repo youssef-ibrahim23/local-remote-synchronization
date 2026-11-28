@@ -233,7 +233,16 @@ final class GraphQLRemoteSyncAdapter implements RemoteSyncAdapter {
   /// [String], [bool], finite numbers, string-keyed [Map]s, and [List]s
   /// of recursively valid values. [path] identifies the offending value
   /// in diagnostics (for example `variables.input.data`).
-  static void _validateJsonCompatible(Object? value, String path) {
+  ///
+  /// [ancestors] tracks the identity of Maps/Lists on the current
+  /// recursion path so circular references are rejected. A shared
+  /// (non-circular) reference visited from a different branch is allowed
+  /// because entries are removed once their subtree finishes.
+  static void _validateJsonCompatible(
+    Object? value,
+    String path, [
+    Set<Object>? ancestors,
+  ]) {
     if (value == null || value is String || value is bool || value is int) {
       return;
     }
@@ -251,20 +260,40 @@ final class GraphQLRemoteSyncAdapter implements RemoteSyncAdapter {
       );
     }
     if (value is Map) {
-      for (final entry in value.entries) {
-        final key = entry.key;
-        if (key is! String) {
-          throw GraphQLValidationException(
-            'Non-string map key ${key.runtimeType} at "$path".',
-          );
+      final active = ancestors ?? <Object>{};
+      if (!active.add(value)) {
+        throw GraphQLValidationException(
+          'Circular reference at "$path".',
+        );
+      }
+      try {
+        for (final entry in value.entries) {
+          final key = entry.key;
+          if (key is! String) {
+            throw GraphQLValidationException(
+              'Non-string map key ${key.runtimeType} at "$path".',
+            );
+          }
+          _validateJsonCompatible(entry.value, '$path.$key', active);
         }
-        _validateJsonCompatible(entry.value, '$path.$key');
+      } finally {
+        active.remove(value);
       }
       return;
     }
     if (value is List) {
-      for (var index = 0; index < value.length; index++) {
-        _validateJsonCompatible(value[index], '$path[$index]');
+      final active = ancestors ?? <Object>{};
+      if (!active.add(value)) {
+        throw GraphQLValidationException(
+          'Circular reference at "$path".',
+        );
+      }
+      try {
+        for (var index = 0; index < value.length; index++) {
+          _validateJsonCompatible(value[index], '$path[$index]', active);
+        }
+      } finally {
+        active.remove(value);
       }
       return;
     }

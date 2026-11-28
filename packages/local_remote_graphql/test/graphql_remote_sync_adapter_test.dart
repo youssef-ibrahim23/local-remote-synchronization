@@ -828,6 +828,57 @@ void main() {
       }
     });
 
+    test('a Map referencing itself is rejected', () async {
+      final cyclic = <String, dynamic>{};
+      cyclic['self'] = cyclic;
+      final h = harnessWithVariables({'input': cyclic});
+      final result = await pushWithVariables(h);
+
+      expect(result, isA<SyncFailure>());
+      final failure = result as SyncFailure;
+      expect(failure.error.code, SyncErrorCode.validation);
+      expect(failure.error.isRetryable, isFalse);
+      expect(failure.operationId, 'op-1');
+      expect(failure.error.message, contains('Circular'));
+      expect(h.link.requests, isEmpty);
+    });
+
+    test('a List referencing itself is rejected', () async {
+      final cyclic = <dynamic>[];
+      cyclic.add(cyclic);
+      final h = harnessWithVariables({'items': cyclic});
+      final result = await pushWithVariables(h);
+
+      expect(result, isA<SyncFailure>());
+      expect((result as SyncFailure).error.code, SyncErrorCode.validation);
+      expect(h.link.requests, isEmpty);
+    });
+
+    test('a nested Map/List cycle is rejected', () async {
+      final inner = <String, dynamic>{};
+      final outer = <String, dynamic>{'inner': inner, 'list': <dynamic>[]};
+      (outer['list'] as List).add(inner);
+      inner['back'] = outer;
+      final h = harnessWithVariables({'input': outer});
+      final result = await pushWithVariables(h);
+
+      expect(result, isA<SyncFailure>());
+      expect((result as SyncFailure).error.code, SyncErrorCode.validation);
+      expect(h.link.requests, isEmpty);
+    });
+
+    test('shared non-circular references are accepted', () async {
+      final shared = <String, dynamic>{'v': 1};
+      final h = harnessWithVariables({
+        'first': shared,
+        'second': [shared, shared],
+      });
+      final result = await pushWithVariables(h);
+
+      expect(result, isA<SyncSuccess>());
+      expect(h.link.requests, hasLength(1));
+    });
+
     test('unsupported values inside lists are rejected', () async {
       final h = harnessWithVariables({
         'items': [1, Object(), 3],
