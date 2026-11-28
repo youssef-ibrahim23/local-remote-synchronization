@@ -26,12 +26,12 @@ void main() {
       : false;
 
   group('PostgreSQL version trigger', skip: skipReason, () {
-    late Connection connection;
-    late String table;
-    late String function;
+    Connection? connection;
+    var table = '';
+    var function = '';
 
     Future<int> versionOf(String id) async {
-      final result = await connection.execute(
+      final result = await connection!.execute(
         "select version from $table where id = '$id'",
       );
       expect(result, hasLength(1));
@@ -39,7 +39,7 @@ void main() {
     }
 
     Future<Map<String, dynamic>> rowOf(String id) async {
-      final result = await connection.execute(
+      final result = await connection!.execute(
         "select * from $table where id = '$id'",
       );
       expect(result, hasLength(1));
@@ -47,21 +47,26 @@ void main() {
     }
 
     setUpAll(() async {
-      connection = await Connection.openFromUrl(dsn!);
       final suffix = DateTime.now().microsecondsSinceEpoch;
       table = 'notes_vtest_$suffix';
       function = 'bump_row_version_$suffix';
+      connection = await Connection.openFromUrl(dsn!);
 
       // Mirrors the README trigger exactly: version increments only when
-      // the row actually changes (OLD IS DISTINCT FROM NEW).
-      await connection.execute('''
+      // the row actually changes (OLD IS DISTINCT FROM NEW). Each
+      // statement is executed separately because the postgres package
+      // uses the Extended Query Protocol, which rejects multi-statement
+      // strings.
+      await connection!.execute('''
         create table $table (
           id text primary key,
           title text not null,
           _sync_operation_id text,
           version bigint not null default 1
-        );
+        )
+      ''');
 
+      await connection!.execute('''
         create or replace function $function()
         returns trigger
         language plpgsql
@@ -72,34 +77,43 @@ void main() {
           end if;
           return new;
         end;
-        \$\$;
+        \$\$
+      ''');
 
+      await connection!.execute('''
         create trigger ${table}_version_bump
           before update on $table
           for each row
-          execute function $function();
+          execute function $function()
       ''');
     });
 
     tearDownAll(() async {
+      final conn = connection;
+      if (conn == null) return;
       try {
-        await connection.execute(
-          'drop table if exists $table cascade; '
-          'drop function if exists $function();',
-        );
-      } finally {
-        await connection.close();
+        // Cleanup must not mask test results or throw
+        // LateInitializationError when setup partially failed.
+        await conn.execute('drop table if exists $table cascade');
+      } catch (_) {
+        // Table may not have been created; still try the function drop.
       }
+      try {
+        await conn.execute('drop function if exists $function()');
+      } catch (_) {
+        // Function may not have been created.
+      }
+      await conn.close();
     });
 
     test('A. actual update increments the version', () async {
-      await connection.execute(
+      await connection!.execute(
         'insert into $table (id, title, _sync_operation_id) '
         "values ('a1', 'Hello', 'idem-a1')",
       );
       expect(await versionOf('a1'), 1);
 
-      await connection.execute(
+      await connection!.execute(
         "update $table set title = 'Updated' where id = 'a1'",
       );
 
@@ -108,7 +122,7 @@ void main() {
     });
 
     test('B. no-op update does not increment the version', () async {
-      await connection.execute(
+      await connection!.execute(
         'insert into $table (id, title, _sync_operation_id, version) '
         "values ('b1', 'Same', 'idem-b1', 2)",
       );
@@ -116,7 +130,7 @@ void main() {
 
       // UPDATE that changes nothing — the trigger's IS DISTINCT FROM
       // guard must keep the version at 2.
-      await connection.execute(
+      await connection!.execute(
         "update $table set title = title where id = 'b1'",
       );
 
@@ -124,13 +138,13 @@ void main() {
     });
 
     test('C. conditional update rejects a stale version', () async {
-      await connection.execute(
+      await connection!.execute(
         'insert into $table (id, title, _sync_operation_id, version) '
         "values ('c1', 'Original', 'idem-c1', 2)",
       );
 
       // Conditional PATCH equivalent: id matches but version = 1 is stale.
-      final updated = await connection.execute(
+      final updated = await connection!.execute(
         "update $table set title = 'Stale write' "
         "where id = 'c1' and version = 1",
       );
