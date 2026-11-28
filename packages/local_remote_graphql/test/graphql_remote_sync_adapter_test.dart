@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:collection';
 import 'dart:io';
 
 import 'package:gql/ast.dart';
@@ -867,6 +868,21 @@ void main() {
       expect(h.link.requests, isEmpty);
     });
 
+    test('equal-but-not-identical containers are not circular', () async {
+      // parent and child compare equal via custom ==/hashCode but are
+      // distinct objects — identity-based detection must not flag this.
+      final child = _LengthEqualityList([1]);
+      final parent = _LengthEqualityList([child]);
+      expect(parent, equals(child));
+      expect(identical(parent, child), isFalse);
+
+      final h = harnessWithVariables({'input': parent});
+      final result = await pushWithVariables(h);
+
+      expect(result, isA<SyncSuccess>());
+      expect(h.link.requests, hasLength(1));
+    });
+
     test('shared non-circular references are accepted', () async {
       final shared = <String, dynamic>{'v': 1};
       final h = harnessWithVariables({
@@ -931,3 +947,31 @@ void main() {
 }
 
 DocumentNode _doc(String source) => parseString(source);
+
+/// A [List] whose equality is based on length only — two distinct
+/// instances with the same length compare equal. Used to prove cycle
+/// detection is identity-based, not equality-based.
+final class _LengthEqualityList extends ListBase<dynamic> {
+  _LengthEqualityList(this._items);
+
+  final List<dynamic> _items;
+
+  @override
+  int get length => _items.length;
+
+  @override
+  set length(int newLength) => _items.length = newLength;
+
+  @override
+  dynamic operator [](int index) => _items[index];
+
+  @override
+  void operator []=(int index, dynamic value) => _items[index] = value;
+
+  @override
+  bool operator ==(Object other) =>
+      other is _LengthEqualityList && other.length == length;
+
+  @override
+  int get hashCode => length.hashCode;
+}

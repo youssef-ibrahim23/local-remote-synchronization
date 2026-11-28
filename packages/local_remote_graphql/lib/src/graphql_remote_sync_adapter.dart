@@ -1,3 +1,5 @@
+import 'dart:collection';
+
 import 'package:graphql/client.dart';
 import 'package:local_remote_synchronization/local_remote_synchronization.dart';
 
@@ -260,7 +262,7 @@ final class GraphQLRemoteSyncAdapter implements RemoteSyncAdapter {
       );
     }
     if (value is Map) {
-      final active = ancestors ?? <Object>{};
+      final active = ancestors ?? HashSet<Object>.identity();
       if (!active.add(value)) {
         throw GraphQLValidationException(
           'Circular reference at "$path".',
@@ -282,7 +284,7 @@ final class GraphQLRemoteSyncAdapter implements RemoteSyncAdapter {
       return;
     }
     if (value is List) {
-      final active = ancestors ?? <Object>{};
+      final active = ancestors ?? HashSet<Object>.identity();
       if (!active.add(value)) {
         throw GraphQLValidationException(
           'Circular reference at "$path".',
