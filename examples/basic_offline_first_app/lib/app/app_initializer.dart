@@ -12,19 +12,33 @@ import '../state/todo_app_state.dart';
 import '../sync/connectivity_plus_provider.dart';
 import '../sync/todo_rest_config.dart';
 
+enum _InitState {
+  idle,
+  starting,
+  running,
+  disposing,
+  disposed,
+}
+
 /// Owns the entire application lifecycle: database, adapters, engine, and
 /// [TodoAppState].
 ///
 /// Lifecycle contract:
 /// - [start] may only be called once on an instance. Calling [start] while
-///   already starting, started, or disposed throws a [StateError].
-/// - If [start] fails at any step, all resources already created are cleaned up
-///   in reverse dependency order, the instance transitions to disposed, and the
-///   original exception is rethrown.
-/// - [dispose] is idempotent and safe to call at any time (including after a
-///   partial or failed startup).
-/// - [appState] is only accessible after [start] has completed successfully
-///   and before [dispose] is called.
+///   already starting, running, disposing, or disposed throws a [StateError].
+/// - Every created resource is tracked immediately. After every asynchronous
+///   boundary, [start] checks whether [dispose] has been requested; if so,
+///   startup aborts without creating further resources and [dispose] cleans up
+///   all resources created so far.
+/// - If [start] fails with an exception, all resources created so far are
+///   cleaned up in reverse dependency order, the initializer transitions to
+///   disposed, and the original exception is preserved and rethrown.
+/// - [dispose] is idempotent and safe to call at any time (including while
+///   [start] is in progress or after a failed startup). Concurrent calls to
+///   [dispose] share the same completion future, and [dispose] never completes
+///   while [start] can still create additional resources.
+/// - [appState] is only accessible while running (after [start] completes
+///   without cancellation and before [dispose] is requested).
 final class AppInitializer {
   AppInitializer({
     Future<Database> Function()? openDb,
@@ -56,18 +70,20 @@ final class AppInitializer {
   SyncEngine? _engine;
   TodoAppState? _appState;
 
-  bool _starting = false;
-  bool _started = false;
-  bool _disposed = false;
+  _InitState _state = _InitState.idle;
+  Future<void>? _startupFuture;
   Future<void>? _disposeFuture;
+
+  bool get _isDisposalRequested =>
+      _state == _InitState.disposing || _state == _InitState.disposed;
 
   /// The application state container.
   ///
   /// Throws [StateError] if accessed before [start] completes or after
-  /// [dispose] has been called.
+  /// [dispose] has been requested.
   TodoAppState get appState {
     final state = _appState;
-    if (_disposed || !_started || state == null) {
+    if (_state != _InitState.running || state == null) {
       throw StateError(
         'AppInitializer.appState is unavailable before start() completes or '
         'after dispose().',
@@ -80,27 +96,34 @@ final class AppInitializer {
   /// engine streams, starts the [SyncEngine], and loads initial todos.
   ///
   /// May only be called once. Throws [StateError] if already starting,
-  /// started, or disposed.
+  /// running, disposing, or disposed.
   Future<void> start({
     String? restBaseUrl,
-  }) async {
-    if (_disposed) {
+  }) {
+    if (_isDisposalRequested) {
       throw StateError('AppInitializer is disposed.');
     }
-    if (_starting || _started) {
+    if (_state != _InitState.idle) {
       throw StateError('AppInitializer.start() may only be called once.');
     }
-    _starting = true;
+    _state = _InitState.starting;
+    final startup = _performStart(restBaseUrl: restBaseUrl);
+    _startupFuture = startup;
+    return startup;
+  }
 
+  Future<void> _performStart({String? restBaseUrl}) async {
     try {
       final db = _openDb != null ? await _openDb() : await _defaultOpenDb();
       _db = db;
+      if (_isDisposalRequested) return;
 
       final storageAdapter = _createStorageAdapter != null
           ? _createStorageAdapter(db)
           : SqfliteLocalStorageAdapter(database: db);
       _storageAdapter = storageAdapter;
       await storageAdapter.ensureInitialized();
+      if (_isDisposalRequested) return;
 
       final repository = TodoRepository(
         database: db,
@@ -140,17 +163,26 @@ final class AppInitializer {
       // Start engine — recovers stale inFlight ops, subscribes connectivity,
       // and may schedule an initial sync.
       await engine.start();
+      if (_isDisposalRequested) return;
 
       // Load initial todos from local storage.
       await state.loadTodos();
+      if (_isDisposalRequested) return;
 
-      _started = true;
+      _state = _InitState.running;
     } catch (_) {
-      _disposed = true;
-      await _cleanupResources();
+      // If dispose() was not already called, clean up created resources here.
+      // If dispose() IS in flight, it is awaiting _startupFuture and will run
+      // _cleanupResources() as soon as this catch rethrows — avoiding deadlock.
+      if (_disposeFuture == null) {
+        _state = _InitState.disposing;
+        await _cleanupResources();
+        _state = _InitState.disposed;
+        _disposeFuture = Future<void>.value();
+      }
       rethrow;
     } finally {
-      _starting = false;
+      _startupFuture = null;
     }
   }
 
@@ -169,6 +201,10 @@ final class AppInitializer {
 
   /// Disposes all created resources in reverse dependency order.
   ///
+  /// If [start] is currently in progress, [dispose] prevents further startup
+  /// work, waits for the active startup step to settle, and then cleans up
+  /// every resource that was created.
+  ///
   /// - `TodoAppState` subscriptions are cancelled.
   /// - [SyncEngine] waits for any active cycle before closing its streams.
   /// - [RestRemoteSyncAdapter] closes its owned HTTP client (injected clients
@@ -176,17 +212,27 @@ final class AppInitializer {
   /// - [SqfliteLocalStorageAdapter] releases its stream controller.
   /// - The [Database] is closed.
   ///
-  /// Idempotent: concurrent or repeated calls share the same cleanup and
-  /// complete safely, even after a partial startup failure.
+  /// Idempotent: concurrent or repeated calls share the same completion future.
   Future<void> dispose() {
     final existing = _disposeFuture;
     if (existing != null) {
       return existing;
     }
-    _disposed = true;
-    final cleanup = _cleanupResources();
-    _disposeFuture = cleanup;
-    return cleanup;
+    _state = _InitState.disposing;
+    final disposal = _performDispose();
+    _disposeFuture = disposal;
+    return disposal;
+  }
+
+  Future<void> _performDispose() async {
+    final startup = _startupFuture;
+    if (startup != null) {
+      try {
+        await startup;
+      } catch (_) {}
+    }
+    await _cleanupResources();
+    _state = _InitState.disposed;
   }
 
   Future<void> _cleanupResources() async {

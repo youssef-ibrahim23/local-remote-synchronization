@@ -70,7 +70,6 @@ local-remote-synchronization/
 
 | Module | Folder | Responsibility |
 |---|---|---|
-| Core | `src/core/` | Shared base types, internal helpers |
 | Contracts | `src/contracts/` | `LocalStorageAdapter`, `OutboxWriter`, `RemoteSyncAdapter`, `ConnectivityProvider` |
 | Models | `src/models/` | `SyncOperation`, `LocalMutation`, `SyncResult` (`SyncSuccess`, `SyncConflict`, `SyncFailure`), `SyncError` |
 | Enums | `src/enums/` | `SyncOperationType`, `SyncOperationStatus`, `SyncErrorCode` |
