@@ -171,14 +171,19 @@ final class AppInitializer {
 
       _state = _InitState.running;
     } catch (_) {
-      // If dispose() was not already called, clean up created resources here.
-      // If dispose() IS in flight, it is awaiting _startupFuture and will run
-      // _cleanupResources() as soon as this catch rethrows — avoiding deadlock.
+      // If dispose() was not already called, assign _disposeFuture
+      // synchronously before awaiting cleanup so any concurrent or subsequent
+      // dispose() shares this exact completion future without deadlocking or
+      // running cleanup twice.
+      // If dispose() IS already in flight, it is awaiting _startupFuture and
+      // will run _cleanupResources() as soon as this catch rethrows.
       if (_disposeFuture == null) {
         _state = _InitState.disposing;
-        await _cleanupResources();
-        _state = _InitState.disposed;
-        _disposeFuture = Future<void>.value();
+        final cleanupFuture = _cleanupResources().whenComplete(() {
+          _state = _InitState.disposed;
+        });
+        _disposeFuture = cleanupFuture;
+        await cleanupFuture;
       }
       rethrow;
     } finally {

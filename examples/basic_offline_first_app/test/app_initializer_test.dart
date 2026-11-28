@@ -460,6 +460,78 @@ void main() {
         expect(() => initializer.appState, throwsStateError);
       }, () => trackingClient);
     });
+
+    test(
+        'Test E — dispose() during startup-failure cleanup shares the same '
+        'Future and preserves the original exception', () async {
+      final closeEntered = Completer<void>();
+      final closeGate = Completer<void>();
+      final trackingClient = _TrackingHttpClient();
+      var storageStreamClosed = false;
+      var dbCloseCount = 0;
+      late Database realDb;
+
+      await http.runWithClient(() async {
+        final initializer = AppInitializer(
+          openDb: () async {
+            realDb = await openTestDb();
+            return _GatedExecuteDatabase(
+              realDb,
+              onClose: () async {
+                dbCloseCount++;
+                if (!closeEntered.isCompleted) closeEntered.complete();
+                await closeGate.future;
+              },
+            );
+          },
+          createStorageAdapter: (db) {
+            final adapter = SqfliteLocalStorageAdapter(database: db);
+            adapter.watchPendingCount().listen(
+                  (_) {},
+                  onDone: () => storageStreamClosed = true,
+                );
+            return adapter;
+          },
+          createConnectivityProvider: _ThrowingConnectivity.new,
+        );
+
+        final startFuture =
+            initializer.start(restBaseUrl: 'http://localhost:8080');
+
+        // Wait until startup failure cleanup reaches db.close().
+        await closeEntered.future;
+
+        var d1Completed = false;
+        final d1 = initializer.dispose().then((_) {
+          d1Completed = true;
+        });
+
+        // d1 must wait for the gated cleanup to finish.
+        await Future<void>.delayed(Duration.zero);
+        expect(d1Completed, isFalse);
+
+        // Also capture raw dispose() future before and after release.
+        final d2 = initializer.dispose();
+        final d3 = initializer.dispose();
+        expect(identical(d2, d3), isTrue);
+
+        closeGate.complete();
+
+        await expectLater(startFuture, throwsA(isA<FormatException>()));
+        await Future.wait([d1, d2, d3]);
+
+        // Subsequent dispose() still shares the exact same Future.
+        final d4 = initializer.dispose();
+        expect(identical(d2, d4), isTrue);
+
+        expect(d1Completed, isTrue);
+        expect(dbCloseCount, 1);
+        expect(trackingClient.closeCount, 1);
+        expect(storageStreamClosed, isTrue);
+        expect(realDb.isOpen, isFalse);
+        expect(() => initializer.appState, throwsStateError);
+      }, () => trackingClient);
+    });
   });
 }
 
@@ -524,21 +596,25 @@ final class _GatedConnectivity implements ConnectivityProvider {
   Stream<bool> get onConnectivityChanged => const Stream.empty();
 }
 
-/// Delegating [Database] that gates the first [execute] call on a Future so
-/// tests can deterministically pause inside `ensureInitialized()`.
+/// Delegating [Database] that can gate the first [execute] call or [close]
+/// on a Future so tests can deterministically pause inside
+/// `ensureInitialized()` or cleanup.
 final class _GatedExecuteDatabase implements Database {
   _GatedExecuteDatabase(
     this._inner, {
-    required Future<void> Function() onFirstExecute,
-  }) : _onFirstExecute = onFirstExecute;
+    Future<void> Function()? onFirstExecute,
+    Future<void> Function()? onClose,
+  })  : _onFirstExecute = onFirstExecute,
+        _onClose = onClose;
 
   final Database _inner;
-  final Future<void> Function() _onFirstExecute;
+  final Future<void> Function()? _onFirstExecute;
+  final Future<void> Function()? _onClose;
   bool _gated = false;
 
   @override
   Future<void> execute(String sql, [List<Object?>? arguments]) async {
-    if (!_gated) {
+    if (!_gated && _onFirstExecute != null) {
       _gated = true;
       await _onFirstExecute();
     }
@@ -553,10 +629,22 @@ final class _GatedExecuteDatabase implements Database {
       _inner.rawQuery(sql, arguments);
 
   @override
+  Future<int> rawUpdate(
+    String sql, [
+    List<Object?>? arguments,
+  ]) =>
+      _inner.rawUpdate(sql, arguments);
+
+  @override
   bool get isOpen => _inner.isOpen;
 
   @override
-  Future<void> close() => _inner.close();
+  Future<void> close() async {
+    if (_onClose != null) {
+      await _onClose();
+    }
+    return _inner.close();
+  }
 
   @override
   dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
