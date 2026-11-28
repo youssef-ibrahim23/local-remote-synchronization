@@ -4,6 +4,7 @@ import 'package:local_remote_synchronization/local_remote_synchronization.dart';
 import 'graphql_entity_config.dart';
 import 'graphql_error_mapper.dart';
 import 'graphql_mutation_outcome.dart';
+import 'graphql_validation_exception.dart';
 
 /// [RemoteSyncAdapter] implementation that applies local mutations to a
 /// GraphQL backend through an application-owned [GraphQLClient].
@@ -122,6 +123,21 @@ final class GraphQLRemoteSyncAdapter implements RemoteSyncAdapter {
     }
 
     try {
+      _validateJsonCompatible(variables, 'variables');
+    } on GraphQLValidationException catch (error, stackTrace) {
+      return SyncFailure(
+        operationId: operation.operationId,
+        error: SyncError(
+          code: SyncErrorCode.validation,
+          message: 'Invalid GraphQL variables: ${error.message}',
+          isRetryable: false,
+          cause: error,
+          stackTrace: stackTrace,
+        ),
+      );
+    }
+
+    try {
       final result = await _client.mutate<dynamic>(
         MutationOptions(
           document: operationConfig.document,
@@ -211,5 +227,49 @@ final class GraphQLRemoteSyncAdapter implements RemoteSyncAdapter {
       GraphQLMutationFailure(:final error) =>
         SyncFailure(operationId: operation.operationId, error: error),
     };
+  }
+
+  /// Recursively verifies that [value] is JSON-serializable: `null`,
+  /// [String], [bool], finite numbers, string-keyed [Map]s, and [List]s
+  /// of recursively valid values. [path] identifies the offending value
+  /// in diagnostics (for example `variables.input.data`).
+  static void _validateJsonCompatible(Object? value, String path) {
+    if (value == null || value is String || value is bool || value is int) {
+      return;
+    }
+    if (value is double) {
+      if (!value.isFinite) {
+        throw GraphQLValidationException(
+          'Non-finite number at "$path".',
+        );
+      }
+      return;
+    }
+    if (value is num) {
+      throw GraphQLValidationException(
+        'Unsupported numeric value at "$path".',
+      );
+    }
+    if (value is Map) {
+      for (final entry in value.entries) {
+        final key = entry.key;
+        if (key is! String) {
+          throw GraphQLValidationException(
+            'Non-string map key ${key.runtimeType} at "$path".',
+          );
+        }
+        _validateJsonCompatible(entry.value, '$path.$key');
+      }
+      return;
+    }
+    if (value is List) {
+      for (var index = 0; index < value.length; index++) {
+        _validateJsonCompatible(value[index], '$path[$index]');
+      }
+      return;
+    }
+    throw GraphQLValidationException(
+      'Unsupported value of type ${value.runtimeType} at "$path".',
+    );
   }
 }

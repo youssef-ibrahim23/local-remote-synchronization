@@ -718,6 +718,130 @@ void main() {
     });
   });
 
+  group('variables validation', () {
+    GraphQLTestHarness harnessWithVariables(Map<String, dynamic> variables) =>
+        GraphQLTestHarness.create(
+          entityMapping: {
+            'note': GraphQLEntityConfig(
+              create: GraphQLOperationConfig(
+                document: _doc('mutation { c }'),
+                variables: (_) => variables,
+              ),
+            ),
+          },
+        );
+
+    Future<SyncResult> pushWithVariables(GraphQLTestHarness h) async {
+      h.link.enqueueData({'c': true});
+      return h.adapter.push(makeOperation(payload: {'x': 1}));
+    }
+
+    test('valid nested JSON variables are accepted and sent', () async {
+      final h = harnessWithVariables({
+        'input': {
+          'id': 'entity-1',
+          'tags': ['a', 'b'],
+          'count': 3,
+          'ratio': 1.5,
+          'flag': true,
+          'nothing': null,
+          'nested': {
+            'list': [
+              1,
+              'two',
+              false,
+              null,
+              {'deep': 4}
+            ],
+          },
+        },
+      });
+
+      final result = await pushWithVariables(h);
+
+      expect(result, isA<SyncSuccess>());
+      expect(h.link.requests, hasLength(1));
+      expect(
+        h.link.requests.single.variables['input'],
+        isA<Map<String, dynamic>>(),
+      );
+    });
+
+    test('arbitrary object at the top level is rejected', () async {
+      final h = harnessWithVariables({'input': Object()});
+      final result = await pushWithVariables(h);
+
+      expect(result, isA<SyncFailure>());
+      final failure = result as SyncFailure;
+      expect(failure.error.code, SyncErrorCode.validation);
+      expect(failure.error.isRetryable, isFalse);
+      expect(failure.operationId, 'op-1');
+      expect(h.link.requests, isEmpty);
+    });
+
+    test('arbitrary object nested in a map is rejected with its path',
+        () async {
+      final h = harnessWithVariables({
+        'input': {
+          'data': {'bad': Object()},
+        },
+      });
+      final result = await pushWithVariables(h);
+
+      expect(result, isA<SyncFailure>());
+      final failure = result as SyncFailure;
+      expect(failure.error.code, SyncErrorCode.validation);
+      expect(failure.error.message, contains('variables.input.data.bad'));
+      expect(h.link.requests, isEmpty);
+    });
+
+    test('non-string map keys are rejected', () async {
+      final h = harnessWithVariables({
+        'input': <dynamic, dynamic>{1: 'x'},
+      });
+      final result = await pushWithVariables(h);
+
+      expect(result, isA<SyncFailure>());
+      expect((result as SyncFailure).error.code, SyncErrorCode.validation);
+      expect(h.link.requests, isEmpty);
+    });
+
+    test('NaN is rejected', () async {
+      final h = harnessWithVariables({'ratio': double.nan});
+      final result = await pushWithVariables(h);
+
+      expect(result, isA<SyncFailure>());
+      expect((result as SyncFailure).error.code, SyncErrorCode.validation);
+      expect(h.link.requests, isEmpty);
+    });
+
+    test('infinities are rejected', () async {
+      for (final bad in [double.infinity, double.negativeInfinity]) {
+        final h = harnessWithVariables({'ratio': bad});
+        final result = await pushWithVariables(h);
+        expect(result, isA<SyncFailure>());
+        expect(
+          (result as SyncFailure).error.code,
+          SyncErrorCode.validation,
+        );
+        expect(h.link.requests, isEmpty);
+      }
+    });
+
+    test('unsupported values inside lists are rejected', () async {
+      final h = harnessWithVariables({
+        'items': [1, Object(), 3],
+      });
+      final result = await pushWithVariables(h);
+
+      expect(result, isA<SyncFailure>());
+      final failure = result as SyncFailure;
+      expect(failure.error.code, SyncErrorCode.validation);
+      expect(failure.error.message, contains('variables.items[1]'));
+      expect(h.link.requests, isEmpty);
+    });
+  });
+
   group('contract', () {
     test('every result preserves the operation id', () async {
       harness.link
