@@ -85,7 +85,8 @@ void main() {
       expect(event.conflict.remoteSnapshot, {'key': 'remote-value'});
     });
 
-    test('error stored in markDeadLetter has conflict code and is not retryable',
+    test(
+        'error stored in markDeadLetter has conflict code and is not retryable',
         () async {
       // We capture the SyncError passed to markDeadLetter by wrapping the fake.
       SyncError? capturedError;
@@ -146,14 +147,10 @@ void main() {
       final conflictEvents = <SyncConflictEvent>[];
 
       // We use a gate on markDeadLetter to freeze it mid-way.
-      storage.operations.add(makeOperation('op-1'));
       remote.resultFor = (op) => SyncConflict(
             operationId: op.operationId,
             remoteSnapshot: const {'x': 1},
           );
-
-      // We capture events on the stream.
-      engine.conflicts.listen(conflictEvents.add);
 
       // Replace storage to introduce a gate.
       final gatedStorage = _GatedDeadLetterStorage(storage, markDeadLetterGate);
@@ -163,7 +160,8 @@ void main() {
         connectivity: connectivity,
         config: SyncEngineConfig(syncOnStart: false),
       );
-      // Re-seed after rebuilding.
+      // Seed the single operation and attach the single listener on the
+      // new engine.
       storage.operations.add(makeOperation('op-1'));
       engine.conflicts.listen(conflictEvents.add);
 
@@ -235,7 +233,8 @@ void main() {
 
     test('cycle continues after a conflict storage failure', () async {
       engine = buildEngine(
-        config: SyncEngineConfig(batchSize: 2, maxConcurrency: 2, syncOnStart: false),
+        config: SyncEngineConfig(
+            batchSize: 2, maxConcurrency: 2, syncOnStart: false),
       );
       storage.operations.addAll([
         makeOperation('op-1'),
@@ -243,7 +242,8 @@ void main() {
       ]);
       storage.markDeadLetterFailures.add('op-1');
       remote.resultFor = (op) => op.operationId == 'op-1'
-          ? SyncConflict(operationId: op.operationId, remoteSnapshot: const {'x': 1})
+          ? SyncConflict(
+              operationId: op.operationId, remoteSnapshot: const {'x': 1})
           : SyncSuccess(operationId: op.operationId);
 
       await engine.start();
@@ -279,7 +279,8 @@ void main() {
           reason: 'The event carries the pre-transition status');
     });
 
-    test('event.operation.status is failed when fetched as failed op', () async {
+    test('event.operation.status is failed when fetched as failed op',
+        () async {
       // Seed a failed operation (retryAt in the past = eligible).
       storage.operations.add(
         makeOperation(
@@ -366,8 +367,8 @@ void main() {
       expect(report.conflicted, 3);
       expect(report.deadLettered, 3);
       expect(report.storageErrors, 0);
-      expect(storage.deadLetterCalls,
-          unorderedEquals(['op-1', 'op-2', 'op-3']));
+      expect(
+          storage.deadLetterCalls, unorderedEquals(['op-1', 'op-2', 'op-3']));
       expect(receivedEvents, hasLength(3));
       expect(
         receivedEvents.map((e) => e.operation.operationId),
@@ -567,9 +568,7 @@ void main() {
       expect(storage.statusOf('op-1'), SyncOperationStatus.deadLetter);
     });
 
-    test(
-        'SyncConflict mismatch does not invoke retry policy',
-        () async {
+    test('SyncConflict mismatch does not invoke retry policy', () async {
       final fakePolicy = _RecordingRetryPolicy();
       engine = buildEngine(retryPolicy: fakePolicy);
 

@@ -528,32 +528,35 @@ final class SyncEngine {
         message: 'Remote conflict: ${result.remoteVersion ?? "unknown"}',
         isRetryable: false,
       );
-      // Step 1: Persist before notification. The storage transition is
-      // kept in its own try/catch so that a storage failure counts as
-      // storageErrors and never as conflicted or deadLettered.
+      // Step 1: Persist before notification. The storage try/catch is
+      // limited to markDeadLetter so that a persistence failure counts
+      // as storageErrors and never as conflicted or deadLettered.
       try {
         await _localStorage.markDeadLetter(
           op.operationId,
           attemptCount: op.attemptCount + 1,
           error: error,
         );
-        // Step 2: Only after successful persistence, increment counters
-        // and emit the event. The event carries the original immutable
-        // operation (pre-transition snapshot).
-        accumulator.deadLettered++;
-        accumulator.conflicted++;
-        _conflictController.add(
-          SyncConflictEvent(
-            operation: op,
-            conflict: result,
-          ),
-        );
       } catch (_) {
         // Storage transition failed — persisted state is UNKNOWN.
         // Do not increment conflicted or deadLettered. Do not emit event.
         // Do not retry the storage transition blindly.
         accumulator.storageErrors++;
+        return;
       }
+      // Step 2: Only after successful persistence, increment counters
+      // and emit the event. The event carries the original immutable
+      // operation (pre-transition snapshot). Emission is intentionally
+      // outside the storage try/catch: an event-emission exception must
+      // not be misclassified as a storage error.
+      accumulator.deadLettered++;
+      accumulator.conflicted++;
+      _conflictController.add(
+        SyncConflictEvent(
+          operation: op,
+          conflict: result,
+        ),
+      );
       return;
     }
 
