@@ -12,6 +12,7 @@ import '../models/sync_operation.dart';
 import '../models/sync_result.dart';
 import 'exponential_backoff_retry_policy.dart';
 import 'retry_policy.dart';
+import 'sync_conflict_event.dart';
 import 'sync_engine_config.dart';
 
 part 'sync_cycle_report.dart';
@@ -24,8 +25,11 @@ part 'sync_cycle_report.dart';
 ///
 /// Phase 3.2 scope adds retry scheduling via [RetryPolicy], operation-
 /// level storage failure reporting, a fixed per-cycle eligibility
-/// cutoff, and same-cycle attempt deduplication. Conflict handling and
-/// per-entity ordering guards are added in later phases.
+/// cutoff, and same-cycle attempt deduplication.
+///
+/// Phase 3.3 scope adds [conflicts] broadcast stream and durable conflict
+/// transition through [LocalStorageAdapter.markDeadLetter]. Per-entity
+/// ordering guards are added in Phase 3.4.
 final class SyncEngine {
   /// Creates a [SyncEngine] with the given adapters and configuration.
   ///
@@ -74,12 +78,36 @@ final class SyncEngine {
   final StreamController<SyncCycleReport> _reportController =
       StreamController<SyncCycleReport>.broadcast();
 
+  final StreamController<SyncConflictEvent> _conflictController =
+      StreamController<SyncConflictEvent>.broadcast();
+
   /// Whether [start] has completed successfully and [dispose] has not
   /// been requested.
   bool get isRunning => _started && !_disposeRequested;
 
   /// Stream of [SyncCycleReport]s emitted after each completed cycle.
   Stream<SyncCycleReport> get reports => _reportController.stream;
+
+  /// Stream of [SyncConflictEvent]s emitted after a conflict has been
+  /// durably persisted as `deadLetter`.
+  ///
+  /// **Added in Phase 3.3** — not present on the Phase 3.1/3.2 engine.
+  ///
+  /// This is an **ephemeral broadcast notification**, not durable storage.
+  /// If no listener is attached when the event is emitted, the event is
+  /// lost. The `remoteSnapshot` is not persisted separately and may be
+  /// lost if the process crashes before the application handles the event.
+  ///
+  /// The [SyncConflictEvent.operation] is a **pre-transition snapshot** —
+  /// its `status` field reflects the state at fetch time (e.g., `pending`
+  /// or `failed`), not `deadLetter`. The adapter does not mutate the
+  /// in-memory `SyncOperation` instance.
+  ///
+  /// The operation remains `deadLetter` in the outbox after notification
+  /// (assuming `markDeadLetter` succeeded). Later operations for the same
+  /// entity remain blocked. The Core contract does **not** provide a
+  /// supported conflict-resolution or discard workflow.
+  Stream<SyncConflictEvent> get conflicts => _conflictController.stream;
 
   /// Starts the engine.
   ///
@@ -279,6 +307,7 @@ final class SyncEngine {
       } catch (_) {}
     }
     await _reportController.close();
+    await _conflictController.close();
   }
 
   Future<void> _executeCycle(_CycleSlot slot) async {
@@ -490,17 +519,42 @@ final class SyncEngine {
       return;
     }
 
-    // Phase 3.1 interim preserved until Phase 3.3: a SyncConflict has
-    // no transition path yet, so it remains a cycle-level abort. It is
-    // never treated as a retryable SyncFailure.
+    // Phase 3.3: a valid SyncConflict is dead-lettered durably, then a
+    // SyncConflictEvent is emitted on the conflicts stream. This is NOT
+    // a retryable failure — RetryPolicy is not consulted.
     if (result is SyncConflict) {
-      accumulator.cycleError = SyncError(
+      final error = SyncError(
         code: SyncErrorCode.conflict,
-        message: 'Remote conflict received; conflict handling is not '
-            'available in this version.',
+        message: 'Remote conflict: ${result.remoteVersion ?? "unknown"}',
         isRetryable: false,
       );
-      throw const _CycleAbortException();
+      // Step 1: Persist before notification. The storage transition is
+      // kept in its own try/catch so that a storage failure counts as
+      // storageErrors and never as conflicted or deadLettered.
+      try {
+        await _localStorage.markDeadLetter(
+          op.operationId,
+          attemptCount: op.attemptCount + 1,
+          error: error,
+        );
+        // Step 2: Only after successful persistence, increment counters
+        // and emit the event. The event carries the original immutable
+        // operation (pre-transition snapshot).
+        accumulator.deadLettered++;
+        accumulator.conflicted++;
+        _conflictController.add(
+          SyncConflictEvent(
+            operation: op,
+            conflict: result,
+          ),
+        );
+      } catch (_) {
+        // Storage transition failed — persisted state is UNKNOWN.
+        // Do not increment conflicted or deadLettered. Do not emit event.
+        // Do not retry the storage transition blindly.
+        accumulator.storageErrors++;
+      }
+      return;
     }
 
     // result is SyncFailure — schedule a retry or dead-letter via the
@@ -543,13 +597,6 @@ final class SyncEngine {
 /// Private reservation token for the single-flight cycle.
 final class _CycleSlot {
   final Completer<SyncCycleReport> completer = Completer<SyncCycleReport>();
-}
-
-/// Private signal that aborts the current cycle after the in-flight
-/// chunk settles. The specific [SyncError] is stored on the accumulator
-/// before throwing.
-final class _CycleAbortException implements Exception {
-  const _CycleAbortException();
 }
 
 /// Mutable per-cycle statistics accumulator. Exactly one immutable

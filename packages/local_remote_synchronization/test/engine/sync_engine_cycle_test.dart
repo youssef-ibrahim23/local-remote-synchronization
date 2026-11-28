@@ -373,7 +373,7 @@ void main() {
       expect(storage.statusOf('op-1'), SyncOperationStatus.failed);
     });
 
-    test('SyncConflict result still aborts cycle (Phase 3.3 pending)',
+    test('SyncConflict result is dead-lettered and emits conflict event',
         () async {
       storage.operations.add(makeOperation('op-1'));
       remote.resultFor = (op) => SyncConflict(
@@ -382,14 +382,22 @@ void main() {
           );
       await engine.start();
 
+      final conflictFuture = engine.conflicts.first;
       final report = await engine.syncNow();
 
-      expect(storage.deadLetterCalls, isEmpty);
-      expect(storage.failedCalls, isEmpty);
-      expect(report.cycleError, isNotNull);
-      expect(report.cycleError!.code, SyncErrorCode.conflict);
-      expect(report.conflicted, 0);
+      // Phase 3.3: conflict is dead-lettered, NOT a cycle-level abort.
+      expect(report.cycleError, isNull);
+      expect(report.conflicted, 1);
+      expect(report.deadLettered, 1);
+      expect(report.storageErrors, 0);
       expect(report.isSuccess, isFalse);
+      expect(storage.deadLetterCalls, ['op-1']);
+      expect(storage.failedCalls, isEmpty);
+      expect(storage.statusOf('op-1'), SyncOperationStatus.deadLetter);
+
+      final event = await conflictFuture;
+      expect(event.operation.operationId, 'op-1');
+      expect(event.conflict.remoteSnapshot, {'remote': 'state'});
     });
 
     test('remote push throw is converted to retryable SyncFailure', () async {
