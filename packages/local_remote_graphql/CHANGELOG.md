@@ -19,3 +19,13 @@
 - Mutations execute with `FetchPolicy.noCache`.
 - Switched from `graphql_flutter`/Flutter SDK to the pure-Dart `graphql`
   package; tests use `package:test` with a deterministic fake `Link`.
+
+### Fixed
+
+- HTTP status mapping now covers `400`/`422`→validation and `408`→
+  retryable timeout; `ServerException`s carrying parsed GraphQL errors
+  prefer a recognized `extensions.code` over the generic HTTP status.
+- Idempotency documentation corrected: `operation.idempotencyKey` is
+  available to variables builders but is not injected automatically —
+  applications must include it explicitly when backend idempotency is
+  required.

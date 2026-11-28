@@ -199,11 +199,16 @@ fabricates success from an uninterpretable response.
 
 ## Idempotency and delivery guarantees
 
-- The adapter always forwards `operation.idempotencyKey` — through the
-  variables builder — and **never generates a new key**. Retries of the
-  same `SyncOperation` reuse the same key.
-- Sending a key does **not** guarantee deduplication. Actual deduplication
-  requires backend-side idempotency support keyed on that value.
+- `operation.idempotencyKey` is **available** to every variables builder,
+  and the adapter **never generates a new key** — retries of the same
+  `SyncOperation` present the same key to the builder.
+- The adapter cannot verify what an arbitrary variables builder returns,
+  so it does **not** inject the key automatically. The application must
+  explicitly include `operation.idempotencyKey` in the mutation variables
+  (under whatever variable name the backend expects) whenever backend
+  idempotency is required — see the setup example above.
+- Sending the key does **not** guarantee deduplication. The backend must
+  implement deduplication using that key.
 - Delivery is **at-least-once**: Core retries may execute the same mutation
   more than once. There is no adapter-owned ledger or exactly-once claim.
 
@@ -237,10 +242,16 @@ Codes are matched case-insensitively (uppercased before lookup).
 ### Transport errors
 
 - `ServerException` / `HttpLinkServerException` HTTP status mapping:
-  `401`→unauthorized, `403`→forbidden, `404`→notFound,
-  `409`/`412`→conflict, `429`→rateLimited (honors `Retry-After` seconds),
-  `5xx`→serverError — all non-retryable except 429/5xx. `statusCode` is
-  preserved on `SyncError.statusCode`.
+  `400`/`422`→validation, `401`→unauthorized, `403`→forbidden,
+  `404`→notFound, `408`→timeout (retryable), `409`/`412`→conflict,
+  `429`→rateLimited (honors `Retry-After` seconds), `5xx`→serverError —
+  all non-retryable except 408/429/5xx. `statusCode` is preserved on
+  `SyncError.statusCode`.
+- When a `ServerException` carries both an HTTP status and parsed GraphQL
+  errors, a **recognized** `extensions.code` (the codes in the table
+  above) takes precedence over the generic HTTP status; otherwise the
+  HTTP status mapping applies. A `SyncConflict` may result when the
+  GraphQL error carries a remote snapshot.
 - `SocketException`, `HandshakeException`, `http.ClientException` →
   `network`, retryable.
 - `TimeoutException` → `timeout`, retryable.

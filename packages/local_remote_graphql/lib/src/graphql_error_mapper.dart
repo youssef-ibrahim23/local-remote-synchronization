@@ -120,7 +120,19 @@ abstract final class GraphQLErrorMapper {
     StackTrace stackTrace,
   ) {
     final statusCode = exception.statusCode;
+    final parsedErrors = exception.parsedResponse?.errors;
     if (statusCode != null) {
+      // A recognized GraphQL `extensions.code` is more specific than the
+      // generic HTTP status — prefer it when present. Parsed response
+      // data is already typed (`List<GraphQLError>?`), so inspection
+      // cannot throw on malformed payloads.
+      if (parsedErrors != null) {
+        for (final error in parsedErrors) {
+          if (_recognizedGraphQLCodes.contains(_graphQLCode(error))) {
+            return _mapGraphQLError(operation, error, stackTrace);
+          }
+        }
+      }
       return _mapHttpStatus(
         operation,
         statusCode,
@@ -130,7 +142,6 @@ abstract final class GraphQLErrorMapper {
       );
     }
 
-    final parsedErrors = exception.parsedResponse?.errors;
     if (parsedErrors != null && parsedErrors.isNotEmpty) {
       return _mapGraphQLError(operation, parsedErrors.first, stackTrace);
     }
@@ -182,6 +193,11 @@ abstract final class GraphQLErrorMapper {
     Duration? retryAfter,
   }) {
     final (code, retryable, message) = switch (statusCode) {
+      400 => (
+          SyncErrorCode.validation,
+          false,
+          'GraphQL request was malformed (HTTP 400).'
+        ),
       401 => (
           SyncErrorCode.unauthorized,
           false,
@@ -200,11 +216,21 @@ abstract final class GraphQLErrorMapper {
           'GraphQL endpoint or resource '
               'was not found (HTTP 404).'
         ),
+      408 => (
+          SyncErrorCode.timeout,
+          true,
+          'GraphQL request timed out (HTTP 408).'
+        ),
       409 || 412 => (
           SyncErrorCode.conflict,
           false,
           'GraphQL request '
               'conflicted with remote state (HTTP $statusCode).'
+        ),
+      422 => (
+          SyncErrorCode.validation,
+          false,
+          'GraphQL request failed semantic validation (HTTP 422).'
         ),
       429 => (
           SyncErrorCode.rateLimited,
@@ -238,15 +264,49 @@ abstract final class GraphQLErrorMapper {
     );
   }
 
+  /// GraphQL `extensions.code` values that map to a specific
+  /// [SyncErrorCode]. Used to decide whether a parsed GraphQL error is
+  /// more specific than a generic HTTP status.
+  static const Set<String> _recognizedGraphQLCodes = {
+    'UNAUTHENTICATED',
+    'UNAUTHORIZED',
+    'FORBIDDEN',
+    'PERMISSION_DENIED',
+    'NOT_FOUND',
+    'CONFLICT',
+    'VERSION_CONFLICT',
+    'BAD_USER_INPUT',
+    'VALIDATION_ERROR',
+    'INVALID_ARGUMENT',
+    'GRAPHQL_VALIDATION_FAILED',
+    'RATE_LIMITED',
+    'TOO_MANY_REQUESTS',
+    'THROTTLED',
+    'SERVICE_UNAVAILABLE',
+    'UNAVAILABLE',
+    'DEADLINE_EXCEEDED',
+    'TIMEOUT',
+    'TIMED_OUT',
+    'INTERNAL_SERVER_ERROR',
+    'INTERNAL',
+    'CANCELLED',
+    'CANCELED',
+  };
+
+  /// Returns the normalized (uppercased) `extensions.code` of [error],
+  /// or an empty string when absent or not a string.
+  static String _graphQLCode(GraphQLError error) {
+    final raw = error.extensions?['code'];
+    return raw is String ? raw.toUpperCase() : '';
+  }
+
   /// Maps a single [GraphQLError] using `extensions.code` when present.
   static SyncResult _mapGraphQLError(
     SyncOperation operation,
     GraphQLError error,
     StackTrace stackTrace,
   ) {
-    final extensions = error.extensions;
-    final rawCode = extensions?['code'];
-    final code = rawCode is String ? rawCode.toUpperCase() : '';
+    final code = _graphQLCode(error);
     final message =
         error.message.isNotEmpty ? error.message : 'GraphQL mutation failed.';
 

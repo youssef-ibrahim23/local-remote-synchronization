@@ -19,12 +19,16 @@ import 'graphql_mutation_outcome.dart';
 /// adapter never initializes an endpoint, never manages credentials, and
 /// never disposes the injected client.
 ///
-/// Idempotency: the adapter always sends the original
-/// [SyncOperation.idempotencyKey] (via the configured variables builder)
-/// and never generates a new one, so retries reuse the same key. Sending
-/// the key does **not** itself guarantee deduplication — the backend must
-/// implement idempotency. Delivery is at-least-once: Core retries may
-/// execute the same mutation more than once.
+/// Idempotency: [SyncOperation.idempotencyKey] is exposed to the
+/// configured variables builders, and the adapter never generates a new
+/// one — retries of the same operation present the same key. However,
+/// the adapter cannot guarantee that an arbitrary variables builder
+/// actually includes the key in the returned variables: the application
+/// must explicitly map `operation.idempotencyKey` into the mutation
+/// variables whenever backend idempotency is required, and the backend
+/// must implement deduplication using that key. Sending the key does
+/// not itself guarantee deduplication. Delivery is at-least-once: Core
+/// retries may execute the same mutation more than once.
 final class GraphQLRemoteSyncAdapter implements RemoteSyncAdapter {
   /// Creates an adapter backed by [client] and [entityMapping].
   ///

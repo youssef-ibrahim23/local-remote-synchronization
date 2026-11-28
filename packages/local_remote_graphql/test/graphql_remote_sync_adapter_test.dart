@@ -235,6 +235,31 @@ void main() {
         expect(input['idempotencyKey'], 'stable-key');
       }
     });
+
+    test('adapter does not inject the key — the builder owns variables',
+        () async {
+      // Documents that the adapter exposes idempotencyKey to the builder
+      // but cannot guarantee it appears in the outgoing variables.
+      final h = GraphQLTestHarness.create(
+        entityMapping: {
+          'note': GraphQLEntityConfig(
+            create: GraphQLOperationConfig(
+              document: _doc('mutation { c }'),
+              variables: (_) => const {'unrelated': true},
+            ),
+          ),
+        },
+      );
+      h.link.enqueueData({'c': true});
+
+      await h.adapter.push(
+        makeOperation(idempotencyKey: 'must-not-appear', payload: {}),
+      );
+
+      final variables = h.link.requests.single.variables;
+      expect(variables, {'unrelated': true});
+      expect(variables.containsKey('idempotencyKey'), isFalse);
+    });
   });
 
   group('response interpretation', () {
@@ -569,6 +594,110 @@ void main() {
         harness.adapter.push(makeOperation(payload: {})),
         throwsA(isA<OperationException>()),
       );
+    });
+
+    ServerException serverError(
+      int status, {
+      List<GraphQLError>? errors,
+    }) =>
+        ServerException(
+          statusCode: status,
+          parsedResponse: Response(errors: errors, response: const {}),
+        );
+
+    GraphQLError codedError(String code) => GraphQLError(
+          message: 'backend error',
+          extensions: {'code': code},
+        );
+
+    test('HTTP 400 without GraphQL errors maps to validation', () async {
+      harness.link.enqueueError(serverError(400));
+      final result = await harness.adapter.push(
+        makeOperation(payload: {}),
+      );
+      expect(result, isA<SyncFailure>());
+      final failure = result as SyncFailure;
+      expect(failure.error.code, SyncErrorCode.validation);
+      expect(failure.error.isRetryable, isFalse);
+      expect(failure.error.statusCode, 400);
+    });
+
+    test('HTTP 400 with BAD_USER_INPUT maps to validation', () async {
+      harness.link.enqueueError(
+        serverError(400, errors: [codedError('BAD_USER_INPUT')]),
+      );
+      final result = await harness.adapter.push(
+        makeOperation(payload: {}),
+      );
+      expect(result, isA<SyncFailure>());
+      final failure = result as SyncFailure;
+      expect(failure.error.code, SyncErrorCode.validation);
+      expect(failure.error.isRetryable, isFalse);
+    });
+
+    test('HTTP 408 maps to retryable timeout', () async {
+      harness.link.enqueueError(serverError(408));
+      final result = await harness.adapter.push(
+        makeOperation(payload: {}),
+      );
+      expect(result, isA<SyncFailure>());
+      final failure = result as SyncFailure;
+      expect(failure.error.code, SyncErrorCode.timeout);
+      expect(failure.error.isRetryable, isTrue);
+      expect(failure.error.statusCode, 408);
+    });
+
+    test('HTTP 422 maps to validation', () async {
+      harness.link.enqueueError(serverError(422));
+      final result = await harness.adapter.push(
+        makeOperation(payload: {}),
+      );
+      expect(result, isA<SyncFailure>());
+      final failure = result as SyncFailure;
+      expect(failure.error.code, SyncErrorCode.validation);
+      expect(failure.error.isRetryable, isFalse);
+      expect(failure.error.statusCode, 422);
+    });
+
+    test('recognized GraphQL code beats generic HTTP status', () async {
+      // HTTP 500 would map to serverError, but RATE_LIMITED is more
+      // specific.
+      harness.link.enqueueError(
+        serverError(500, errors: [codedError('RATE_LIMITED')]),
+      );
+      final result = await harness.adapter.push(
+        makeOperation(payload: {}),
+      );
+      expect(result, isA<SyncFailure>());
+      final failure = result as SyncFailure;
+      expect(failure.error.code, SyncErrorCode.rateLimited);
+      expect(failure.error.isRetryable, isTrue);
+    });
+
+    test('unrecognized GraphQL code falls back to HTTP status', () async {
+      harness.link.enqueueError(
+        serverError(400, errors: [codedError('SOMETHING_ELSE')]),
+      );
+      final result = await harness.adapter.push(
+        makeOperation(payload: {}),
+      );
+      expect(result, isA<SyncFailure>());
+      expect(
+        (result as SyncFailure).error.code,
+        SyncErrorCode.validation,
+      );
+    });
+
+    test('unmapped HTTP status without parsed errors is unknown', () async {
+      harness.link.enqueueError(serverError(418));
+      final result = await harness.adapter.push(
+        makeOperation(payload: {}),
+      );
+      expect(result, isA<SyncFailure>());
+      final failure = result as SyncFailure;
+      expect(failure.error.code, SyncErrorCode.unknown);
+      expect(failure.error.isRetryable, isFalse);
+      expect(failure.error.statusCode, 418);
     });
 
     test('HttpLinkServerException surfaces Retry-After', () async {

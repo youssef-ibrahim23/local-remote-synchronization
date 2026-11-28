@@ -8,6 +8,10 @@ import 'package:local_remote_synchronization/local_remote_synchronization.dart';
 /// variable definitions. Applications are responsible for mapping fields
 /// such as `entityId`, `payload`, `metadata`, and `idempotencyKey` into
 /// the variable names their backend expects.
+///
+/// `operation.idempotencyKey` is stable across retries, but the adapter
+/// does not inject it automatically — the builder must explicitly include
+/// it in the returned variables when backend idempotency is required.
 typedef GraphQLVariablesBuilder = Map<String, dynamic> Function(
     SyncOperation operation);
 
