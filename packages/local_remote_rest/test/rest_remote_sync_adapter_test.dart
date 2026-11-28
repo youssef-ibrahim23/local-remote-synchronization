@@ -628,6 +628,22 @@ void main() {
       expect(failure.error.isRetryable, isTrue);
     });
 
+    test('response body that never completes times out', () async {
+      final h = RestTestHarness.create(
+        requestTimeout: const Duration(milliseconds: 50),
+      );
+      addTearDown(h.dispose);
+      // Headers arrive immediately; the body stream stays open forever.
+      h.http.enqueuePendingBody(200);
+
+      final failure = (await h.adapter.push(
+        makeOperation(payload: {}),
+      )) as SyncFailure;
+      expect(failure.error.code, SyncErrorCode.timeout);
+      expect(failure.error.isRetryable, isTrue);
+      expect(failure.operationId, 'op-1');
+    });
+
     test('every failure preserves the operation id', () async {
       for (final status in [400, 401, 403, 404, 408, 429, 500, 418]) {
         harness.http.enqueue(status);
@@ -638,12 +654,233 @@ void main() {
       }
     });
 
-    test('no raw exception escapes push', () async {
+    test('unexpected programming errors propagate', () async {
       harness.http.enqueueError(StateError('boom'));
       await expectLater(
         harness.adapter.push(makeOperation(payload: {})),
         throwsA(isA<StateError>()),
       );
+    });
+  });
+
+  group('requestTimeout validation', () {
+    Map<String, RestEntityConfig> mapping() => {
+          'note': RestEntityConfig(collectionPath: 'notes'),
+        };
+
+    test('rejects Duration.zero', () {
+      expect(
+        () => RestRemoteSyncAdapter(
+          baseUrl: 'https://api.example.com',
+          entityMapping: mapping(),
+          requestTimeout: Duration.zero,
+        ),
+        throwsArgumentError,
+      );
+    });
+
+    test('rejects a negative duration', () {
+      expect(
+        () => RestRemoteSyncAdapter(
+          baseUrl: 'https://api.example.com',
+          entityMapping: mapping(),
+          requestTimeout: const Duration(seconds: -1),
+        ),
+        throwsArgumentError,
+      );
+    });
+
+    test('accepts a positive duration', () {
+      final adapter = RestRemoteSyncAdapter(
+        baseUrl: 'https://api.example.com',
+        entityMapping: mapping(),
+        requestTimeout: const Duration(seconds: 5),
+      );
+      addTearDown(adapter.close);
+      expect(adapter.requestTimeout, const Duration(seconds: 5));
+    });
+
+    test('defaults to 30 seconds', () {
+      final adapter = RestRemoteSyncAdapter(
+        baseUrl: 'https://api.example.com',
+        entityMapping: mapping(),
+      );
+      addTearDown(adapter.close);
+      expect(adapter.requestTimeout, const Duration(seconds: 30));
+    });
+  });
+
+  group('URI safety', () {
+    test('collectionPath rejects an absolute URL', () {
+      expect(
+        () => RestEntityConfig(collectionPath: 'https://evil.example.com/x'),
+        throwsArgumentError,
+      );
+    });
+
+    test('collectionPath rejects scheme injection', () {
+      expect(
+        () => RestEntityConfig(collectionPath: 'javascript:alert(1)'),
+        throwsArgumentError,
+      );
+    });
+
+    test('collectionPath rejects authority components', () {
+      expect(
+        () => RestEntityConfig(collectionPath: '//evil.example.com/notes'),
+        throwsArgumentError,
+      );
+    });
+
+    test('collectionPath rejects query and fragment', () {
+      expect(
+        () => RestEntityConfig(collectionPath: 'notes?admin=true'),
+        throwsArgumentError,
+      );
+      expect(
+        () => RestEntityConfig(collectionPath: 'notes#frag'),
+        throwsArgumentError,
+      );
+    });
+
+    test('collectionPath rejects dot segments', () {
+      expect(
+        () => RestEntityConfig(collectionPath: 'api/../admin'),
+        throwsArgumentError,
+      );
+      expect(
+        () => RestEntityConfig(collectionPath: './notes'),
+        throwsArgumentError,
+      );
+    });
+
+    test('itemPathTemplate rejects absolute URL and dot segments', () {
+      expect(
+        () => RestEntityConfig(
+          collectionPath: 'notes',
+          itemPathTemplate: 'https://evil.example.com/{id}',
+        ),
+        throwsArgumentError,
+      );
+      expect(
+        () => RestEntityConfig(
+          collectionPath: 'notes',
+          itemPathTemplate: 'notes/../{id}',
+        ),
+        throwsArgumentError,
+      );
+      expect(
+        () => RestEntityConfig(
+          collectionPath: 'notes',
+          itemPathTemplate: 'notes/{id}?x=1',
+        ),
+        throwsArgumentError,
+      );
+    });
+
+    test('percent-encoded dot segments are rejected in config', () {
+      expect(
+        () => RestEntityConfig(collectionPath: 'api/%2E%2E/admin'),
+        throwsArgumentError,
+      );
+      expect(
+        () => RestEntityConfig(
+          collectionPath: 'notes',
+          itemPathTemplate: 'items/%2e/{id}',
+        ),
+        throwsArgumentError,
+      );
+    });
+
+    test('unsafe configuration cannot reach the network', () async {
+      // RestEntityConfig validation throws at construction time, so an
+      // adapter with an unsafe mapping cannot even be built.
+      expect(harness.http.requests, isEmpty);
+    });
+
+    test('entityId "." and ".." fail safely without a request', () async {
+      // Dart's Uri decodes %2E back to '.', so dot-only IDs cannot be
+      // encoded safely — they are rejected as validation failures.
+      for (final id in ['.', '..']) {
+        final result = await harness.adapter.push(
+          makeOperation(
+            type: SyncOperationType.update,
+            entityId: id,
+            payload: {},
+          ),
+        );
+        expect(result, isA<SyncFailure>());
+        final failure = result as SyncFailure;
+        expect(failure.error.code, SyncErrorCode.validation);
+        expect(failure.error.isRetryable, isFalse);
+        expect(failure.operationId, 'op-1');
+      }
+      expect(harness.http.requests, isEmpty);
+    });
+
+    test('entity IDs with reserved characters stay a single segment', () async {
+      const id = 'a/b c?d#e&f=g';
+      harness.http.enqueue(200, body: '{}');
+      await harness.adapter.push(
+        makeOperation(
+          type: SyncOperationType.update,
+          entityId: id,
+          payload: {},
+        ),
+      );
+
+      final uri = harness.http.requests.single.url;
+      expect(uri.host, 'api.example.com');
+      // pathSegments are decoded per segment: the ID must remain a
+      // single segment even though it contains '/', '?', '#', etc.
+      expect(uri.pathSegments, hasLength(2)); // 'notes' + one encoded id
+      expect(uri.pathSegments.last, id);
+      // Reserved characters in the ID must not leak into query/fragment.
+      expect(uri.hasQuery, isFalse);
+      expect(uri.hasFragment, isFalse);
+    });
+
+    test('unicode entity IDs are percent-encoded', () async {
+      harness.http.enqueue(200, body: '{}');
+      await harness.adapter.push(
+        makeOperation(
+          type: SyncOperationType.delete,
+          entityId: 'entité-✓',
+        ),
+      );
+
+      final uri = harness.http.requests.single.url;
+      expect(uri.host, 'api.example.com');
+      expect(uri.pathSegments.last, 'entité-✓');
+    });
+
+    test('resolved request URI always stays on the base origin', () async {
+      final h = RestTestHarness.create(
+        baseUrl: 'https://api.example.com:8443/v1/',
+        entityMapping: {
+          'note': RestEntityConfig(
+            collectionPath: 'notes',
+            itemPathTemplate: 'v1/items/{id}',
+          ),
+        },
+      );
+      addTearDown(h.dispose);
+      h.http.enqueueJson(201, {});
+      await h.adapter.push(makeOperation(payload: {}));
+      expect(h.http.requests.single.url.origin, 'https://api.example.com:8443');
+
+      h.http.enqueue(200, body: '{}');
+      await h.adapter.push(
+        makeOperation(
+          type: SyncOperationType.delete,
+          entityId: 'x',
+        ),
+      );
+      final uri = h.http.requests.last.url;
+      expect(uri.scheme, 'https');
+      expect(uri.host, 'api.example.com');
+      expect(uri.port, 8443);
+      expect(uri.path, '/v1/v1/items/x');
     });
   });
 

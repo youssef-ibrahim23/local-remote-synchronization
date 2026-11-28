@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:http/http.dart' as http;
 import 'package:local_remote_synchronization/local_remote_synchronization.dart';
@@ -45,6 +46,18 @@ abstract final class RestErrorMapper {
         operation,
         code: SyncErrorCode.network,
         message: 'Network failure: ${error.message}',
+        isRetryable: true,
+        cause: error,
+        stackTrace: stackTrace,
+      );
+    }
+    // Mid-body stream failures can surface as raw socket errors rather
+    // than http.ClientException.
+    if (error is SocketException || error is HandshakeException) {
+      return _failure(
+        operation,
+        code: SyncErrorCode.network,
+        message: 'Network failure: $error',
         isRetryable: true,
         cause: error,
         stackTrace: stackTrace,

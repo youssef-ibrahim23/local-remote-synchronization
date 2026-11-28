@@ -59,7 +59,7 @@ final class RestRemoteSyncAdapter implements RemoteSyncAdapter {
     required Map<String, RestEntityConfig> entityMapping,
     http.Client? httpClient,
     Map<String, String> defaultHeaders = const {},
-    this.requestTimeout = const Duration(seconds: 30),
+    Duration requestTimeout = const Duration(seconds: 30),
     this.idempotencyHeader = 'Idempotency-Key',
     this.versionRequestHeader = 'If-Match',
     this.versionResponseHeader = 'ETag',
@@ -68,6 +68,7 @@ final class RestRemoteSyncAdapter implements RemoteSyncAdapter {
         _ownsClient = httpClient == null,
         _client = httpClient ?? http.Client(),
         _defaultHeaders = Map.unmodifiable(defaultHeaders),
+        requestTimeout = _validatedTimeout(requestTimeout),
         _entityMapping = _validatedMapping(entityMapping);
 
   final Uri _baseUri;
@@ -76,7 +77,8 @@ final class RestRemoteSyncAdapter implements RemoteSyncAdapter {
   final Map<String, String> _defaultHeaders;
   final Map<String, RestEntityConfig> _entityMapping;
 
-  /// Maximum time to wait for a single HTTP response.
+  /// Maximum time to wait for a complete HTTP response, including the
+  /// response body.
   final Duration requestTimeout;
 
   /// Header carrying `SyncOperation.idempotencyKey`.
@@ -90,6 +92,17 @@ final class RestRemoteSyncAdapter implements RemoteSyncAdapter {
 
   /// `SyncOperation.metadata` key holding the expected version.
   final String expectedVersionKey;
+
+  static Duration _validatedTimeout(Duration timeout) {
+    if (timeout.isNegative || timeout == Duration.zero) {
+      throw ArgumentError.value(
+        timeout,
+        'requestTimeout',
+        'Must be a positive duration.',
+      );
+    }
+    return timeout;
+  }
 
   static Uri _parseBaseUrl(String baseUrl) {
     final uri = Uri.tryParse(baseUrl.trim());
@@ -242,10 +255,40 @@ final class RestRemoteSyncAdapter implements RemoteSyncAdapter {
   // HTTP plumbing
   // ------------------------------------------------------------------
 
-  Uri _uri(String path) => _baseUri.resolve(path);
+  /// Resolves [path] against `baseUrl` and verifies the result stays on
+  /// the configured origin. Endpoint paths are validated at configuration
+  /// time; this is defense-in-depth so default headers (which may carry
+  /// credentials) can never be sent to another scheme/host/port.
+  Uri _checkedUri(String path) {
+    final resolved = _baseUri.resolve(path);
+    if (resolved.scheme != _baseUri.scheme ||
+        resolved.host != _baseUri.host ||
+        resolved.port != _baseUri.port) {
+      throw RestValidationException(
+        'Resolved request URI escapes the configured baseUrl origin.',
+      );
+    }
+    return resolved;
+  }
 
-  Uri _itemUri(RestEntityConfig config, String entityId) =>
-      _uri(config.itemPath.replaceAll('{id}', Uri.encodeComponent(entityId)));
+  Uri _uri(String path) => _checkedUri(path);
+
+  /// Encodes [entityId] as a single URI path segment. `Uri.encodeComponent`
+  /// leaves `.` unencoded and Dart's `Uri` decodes `%2E` back to `.`, so
+  /// dot-only IDs cannot be smuggled through encoding — they are rejected
+  /// outright rather than risk path traversal during URI resolution.
+  static String _encodeId(String entityId) {
+    if (entityId == '.' || entityId == '..') {
+      throw RestValidationException(
+        'entityId must not be a "." or ".." path segment.',
+      );
+    }
+    return Uri.encodeComponent(entityId);
+  }
+
+  Uri _itemUri(RestEntityConfig config, String entityId) => _checkedUri(
+        config.itemPath.replaceAll('{id}', _encodeId(entityId)),
+      );
 
   Map<String, String> _headers(SyncOperation operation) {
     final headers = <String, String>{..._defaultHeaders};
@@ -276,11 +319,56 @@ final class RestRemoteSyncAdapter implements RemoteSyncAdapter {
       );
     }
 
-    final streamed = await _client.send(request).timeout(requestTimeout,
-        onTimeout: () => throw TimeoutException(
-              'Request to $method $uri exceeded $requestTimeout',
-            ));
-    return http.Response.fromStream(streamed);
+    // requestTimeout is a single deadline covering the entire operation:
+    // sending, waiting for response headers, and consuming the full body.
+    final deadline = DateTime.now().add(requestTimeout);
+    Duration remaining() {
+      final left = deadline.difference(DateTime.now());
+      return left.isNegative ? Duration.zero : left;
+    }
+
+    TimeoutException timeoutError() => TimeoutException(
+          'Request to $method $uri exceeded $requestTimeout',
+        );
+
+    final streamed = await _client
+        .send(request)
+        .timeout(remaining(), onTimeout: () => throw timeoutError());
+
+    // Consume the body manually so the subscription can be cancelled when
+    // the deadline expires — http.Response.fromStream offers no way to
+    // abort an in-flight body read.
+    final buffer = BytesBuilder();
+    final completed = Completer<void>();
+    late StreamSubscription<List<int>> subscription;
+    subscription = streamed.stream.listen(
+      buffer.add,
+      onDone: completed.complete,
+      onError: completed.completeError,
+      cancelOnError: true,
+    );
+    try {
+      await completed.future.timeout(
+        remaining(),
+        onTimeout: () async {
+          await subscription.cancel();
+          throw timeoutError();
+        },
+      );
+    } catch (_) {
+      await subscription.cancel();
+      rethrow;
+    }
+
+    return http.Response.bytes(
+      buffer.toBytes(),
+      streamed.statusCode,
+      headers: streamed.headers,
+      isRedirect: streamed.isRedirect,
+      persistentConnection: streamed.persistentConnection,
+      reasonPhrase: streamed.reasonPhrase,
+      request: streamed.request,
+    );
   }
 
   /// Returns a mutable copy of the operation payload after validating

@@ -16,3 +16,10 @@
   `TimeoutException`, and malformed JSON responses.
 - Idempotent delete-on-404 semantics (documented authorization ambiguity).
 - Deterministic unit tests with a fake `http.Client` (no network).
+- URI safety hardening: endpoint paths reject absolute URLs, schemes,
+  authorities, query/fragment delimiters, and dot segments (including
+  percent-encoded forms); resolved request URIs are verified to stay on
+  the configured origin; dot-only entity IDs are rejected safely.
+- `requestTimeout` now covers the entire HTTP operation including body
+  consumption, is validated as a positive duration at construction, and
+  cancels stalled body subscriptions on timeout.

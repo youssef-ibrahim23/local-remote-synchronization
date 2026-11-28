@@ -68,6 +68,31 @@ final class FakeHttpClient extends http.BaseClient {
     _queue.add(_QueuedResponse.error(error));
   }
 
+  /// Queues a response whose headers arrive immediately but whose body
+  /// stream never emits or completes — used to verify the adapter's
+  /// request timeout covers body consumption.
+  void enqueuePendingBody(
+    int statusCode, {
+    Map<String, String> headers = const {},
+  }) {
+    _queue.add(
+      _QueuedResponse.streamed(
+        statusCode,
+        StreamController<List<int>>().stream,
+        headers,
+      ),
+    );
+  }
+
+  /// Queues a response with a custom body stream.
+  void enqueueStreamed(
+    int statusCode,
+    Stream<List<int>> body, {
+    Map<String, String> headers = const {},
+  }) {
+    _queue.add(_QueuedResponse.streamed(statusCode, body, headers));
+  }
+
   @override
   Future<http.StreamedResponse> send(http.BaseRequest request) async {
     final bodyBytes = await request.finalize().toBytes();
@@ -107,7 +132,7 @@ final class FakeHttpClient extends http.BaseClient {
     }
 
     return http.StreamedResponse(
-      Stream.value(utf8.encode(queued.body)),
+      queued.stream ?? Stream.value(utf8.encode(queued.body)),
       queued.statusCode,
       headers: queued.headers,
       reasonPhrase: queued.statusCode == 204 ? 'No Content' : null,
@@ -117,14 +142,20 @@ final class FakeHttpClient extends http.BaseClient {
 
 final class _QueuedResponse {
   _QueuedResponse.status(this.statusCode, this.body, this.headers)
-      : error = null;
+      : error = null,
+        stream = null;
   _QueuedResponse.error(this.error)
       : statusCode = 0,
         body = '',
-        headers = const {};
+        headers = const {},
+        stream = null;
+  _QueuedResponse.streamed(this.statusCode, this.stream, this.headers)
+      : error = null,
+        body = '';
 
   final int statusCode;
   final String body;
   final Map<String, String> headers;
   final Object? error;
+  final Stream<List<int>>? stream;
 }

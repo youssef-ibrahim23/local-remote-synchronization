@@ -85,7 +85,26 @@ must have an explicit `RestEntityConfig`:
 An unmapped `entityType` returns a non-retryable `SyncErrorCode.validation`
 `SyncFailure` — the adapter never guesses endpoints.
 
----
+### Endpoint path safety
+
+`collectionPath` and `itemPathTemplate` must be **relative** paths. The
+following are rejected at configuration time (`ArgumentError`):
+
+- Absolute URLs and authority components (`https://…`, `//host/…`)
+- URI schemes (`javascript:…`, etc.)
+- Query (`?`) and fragment (`#`) delimiters
+- `.` and `..` path segments — including percent-encoded forms like
+  `%2E%2E`, which Dart's `Uri` decodes back to `.`/`..` during resolution
+
+Entity IDs are percent-encoded as a single path segment, so IDs
+containing `/`, spaces, Unicode, or reserved characters cannot alter the
+URL structure. IDs that are exactly `.` or `..` cannot be encoded safely
+(Dart's `Uri` decodes `%2E` to `.`) and are rejected with a
+non-retryable validation `SyncFailure` before any request is sent.
+
+As a final safeguard, every resolved request URI is verified to keep the
+`baseUrl` scheme, host, and port — default headers (which may carry
+credentials) can never be redirected to another origin.
 
 ## Request mapping
 
@@ -195,7 +214,11 @@ errors propagate rather than being disguised as network failures.
   adapter **never closes** an injected client.
 - When omitted, the adapter creates a default `http.Client` and closes it
   on `adapter.close()`.
-- Each request is bounded by `requestTimeout` (default 30s).
+- Each request is bounded by `requestTimeout` (default 30s, must be a
+  positive `Duration`). The deadline covers the **entire** operation:
+  sending the request, receiving response headers, and consuming the full
+  response body. A stalled body stream times out and its subscription is
+  cancelled.
 
 ---
 

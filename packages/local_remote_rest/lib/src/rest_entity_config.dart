@@ -54,19 +54,16 @@ final class RestEntityConfig {
   String get itemPath => itemPathTemplate ?? '$collectionPath/{id}';
 
   static String _validateCollectionPath(String path) {
-    final normalized = path.trim().replaceAll(RegExp(r'^/+|/+$'), '');
+    final trimmed = path.trim();
+    // Validate before stripping slashes: a leading '//' denotes an
+    // authority component, not a relative path.
+    _rejectUnsafePath(trimmed, 'collectionPath');
+    final normalized = trimmed.replaceAll(RegExp(r'^/+|/+$'), '');
     if (normalized.isEmpty) {
       throw ArgumentError.value(
         path,
         'collectionPath',
         'Must not be blank.',
-      );
-    }
-    if (normalized.contains('?') || normalized.contains('#')) {
-      throw ArgumentError.value(
-        path,
-        'collectionPath',
-        'Must not contain query or fragment delimiters.',
       );
     }
     return normalized;
@@ -95,7 +92,48 @@ final class RestEntityConfig {
         'Must contain the {id} placeholder.',
       );
     }
+    _rejectUnsafePath(normalized, 'itemPathTemplate');
     return normalized;
+  }
+
+  /// Rejects endpoint paths that could escape the configured `baseUrl`
+  /// origin or alter URI resolution: absolute URLs, scheme/authority
+  /// components, query/fragment delimiters, and `.`/`..` path segments.
+  static void _rejectUnsafePath(String path, String argumentName) {
+    final parsed = Uri.tryParse(path);
+    if (parsed != null &&
+        (parsed.scheme.isNotEmpty || parsed.host.isNotEmpty)) {
+      throw ArgumentError.value(
+        path,
+        argumentName,
+        'Must be a relative path — absolute URLs and authority '
+        'components are not allowed.',
+      );
+    }
+    if (path.contains('?') || path.contains('#')) {
+      throw ArgumentError.value(
+        path,
+        argumentName,
+        'Must not contain query or fragment delimiters.',
+      );
+    }
+    for (final segment in path.split('/')) {
+      // Check the decoded segment: percent-encoded dots (%2E) decode to
+      // '.'/'..' during URI resolution and would enable traversal.
+      String decoded;
+      try {
+        decoded = Uri.decodeComponent(segment);
+      } catch (_) {
+        decoded = segment;
+      }
+      if (decoded == '.' || decoded == '..') {
+        throw ArgumentError.value(
+          path,
+          argumentName,
+          'Must not contain "." or ".." path segments.',
+        );
+      }
+    }
   }
 
   @override
