@@ -22,15 +22,18 @@ adapter package that depends on the Core — never the other way around.
  │       local_remote_synchronization (Core)       │
  │                 (Pure Dart)                     │
  │                                                 │
- │  Phase 1 (Implemented):                         │
+ │  Implemented (Core):                            │
+ │    Engine:    SyncEngine, SyncEngineConfig,     │
+ │               RetryPolicy,                      │
+ │               ExponentialBackoffRetryPolicy     │
  │    Contracts: LocalStorageAdapter, OutboxWriter,│
  │               RemoteSyncAdapter,                │
  │               ConnectivityProvider              │
  │    Models:    SyncOperation, LocalMutation,     │
  │               SyncResult, SyncError             │
  │                                                 │
- │  Planned (Future Phases):                       │
- │    SyncEngine, RetryPolicy, ConflictResolver    │
+ │  Out of Core Scope:                             │
+ │    Pull sync, ConflictResolver, background jobs │
  └──────┬──────────────────────────────┬───────────┘
         │  implements                  │  implements
  ┌──────▼──────────┐         ┌─────────▼──────────────────────┐
@@ -96,10 +99,7 @@ the same database technology selected by the application.
 
 ---
 
-## Target Data Flow (Future Engine Orchestration)
-
-> **Note:** `SyncEngine`, `RetryPolicy`, and `ConflictResolver` are planned for
-> subsequent phases and are not yet implemented in Core.
+## Data Flow (Push-Only Engine Orchestration)
 
 ```
 User Action
@@ -108,23 +108,27 @@ User Action
 Atomic Local Write + Outbox Enqueue (via LocalStorageAdapter / typed txn API)
     │
     ▼
-SyncEngine (planned) observes Outbox + ConnectivityProvider
+SyncEngine observes ConnectivityProvider (or manual syncNow())
     │
     ▼
-Apply operation via RemoteSyncAdapter
+Apply eligible operation via RemoteSyncAdapter
     │
-    ├─── Success ──► markSucceeded
+    ├─── SyncSuccess  ──► markSucceeded (removes from active outbox)
     │
-    └─── Failure ──► RetryPolicy (planned) / ConflictResolver (planned)
+    ├─── SyncConflict ──► markDeadLetter + emit SyncConflictEvent on engine.conflicts
+    │
+    └─── SyncFailure  ──► RetryPolicy (markFailed with nextRetryAt, or markDeadLetter)
 ```
 
 ---
 
 ## Idempotency
 
-Every `SyncOperation` carries a stable `operationId` (UUID). Remote adapters
-must use this ID to deduplicate retried operations (e.g., as an idempotency
-key in HTTP headers or a Firestore document ID).
+Every `SyncOperation` carries a stable `idempotencyKey` (defaulting to
+`operationId`). Remote adapters send this key on every push attempt, but
+retrying a request provides **at-least-once** delivery — not guaranteed
+exactly-once remote execution. Effective duplicate protection requires the
+remote backend to persist and deduplicate on `idempotencyKey`.
 
 ---
 

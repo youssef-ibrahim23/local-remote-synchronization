@@ -32,6 +32,9 @@ the Core — never the other way around.
 ┌───────────────────▼─────────────────────────────────────────┐
 │          local_remote_synchronization  (Core)               │
 │                 (Pure Dart — Implemented)                   │
+│  Engine:    SyncEngine, SyncEngineConfig, RetryPolicy,      │
+│             ExponentialBackoffRetryPolicy,                  │
+│             SyncCycleReport, SyncConflictEvent              │
 │  Contracts: LocalStorageAdapter, OutboxWriter,              │
 │             RemoteSyncAdapter, ConnectivityProvider         │
 │  Models:    LocalMutation, SyncOperation, SyncResult,       │
@@ -39,12 +42,14 @@ the Core — never the other way around.
 └──────┬─────────────────────────────────────────────┬────────┘
        │ implements                                  │ implements
 ┌──────▼──────────┐  ┌──────────────┐    ┌──────────▼──────────────────────┐
-│ local_remote_   │  │local_remote_ │    │ local_remote_supabase (Planned) │
-│ sqflite         │  │drift         │    │ local_remote_firestore (Planned)│
-│ (Implemented)   │  │(Implemented) │    │ local_remote_rest (Planned)     │
-│                 │  │local_remote_ │    │ local_remote_graphql (Planned)  │
-│                 │  │hive          │    │                                 │
-│                 │  │(Implemented) │    │                                 │
+│ local_remote_   │  │local_remote_ │    │ local_remote_supabase           │
+│ sqflite         │  │drift         │    │   (Implemented)                 │
+│ (Implemented)   │  │(Implemented) │    │ local_remote_firestore          │
+│                 │  │local_remote_ │    │   (Implemented)                 │
+│                 │  │hive          │    │ local_remote_rest               │
+│                 │  │(Implemented) │    │   (Implemented)                 │
+│                 │  │              │    │ local_remote_graphql            │
+│                 │  │              │    │   (Implemented)                 │
 └─────────────────┘  └──────────────┘    └─────────────────────────────────┘
   LocalStorageAdapter                      RemoteSyncAdapter
   (Each adapter persists its own Outbox in its chosen DB)
@@ -55,7 +60,9 @@ the Core — never the other way around.
 ## Current Status
 
 ### Implemented
-- **Core models & contracts** (`local_remote_synchronization`): `LocalMutation`, `SyncOperation`, `SyncResult` (`SyncSuccess`, `SyncConflict`, `SyncFailure`), `SyncError`, `OutboxWriter`, `LocalStorageAdapter`, `RemoteSyncAdapter`, and `ConnectivityProvider`.
+- **Core models, contracts & engine** (`local_remote_synchronization`):
+  - Models & contracts: `LocalMutation`, `SyncOperation`, `SyncResult` (`SyncSuccess`, `SyncConflict`, `SyncFailure`), `SyncError`, `OutboxWriter`, `LocalStorageAdapter`, `RemoteSyncAdapter`, and `ConnectivityProvider`.
+  - Push-only orchestration: `SyncEngine`, `SyncEngineConfig`, `SyncCycleReport`, `SyncConflictEvent`, `RetryPolicy`, and `ExponentialBackoffRetryPolicy` (with startup `inFlight` recovery, per-entity FIFO ordering, single-flight cycle deduplication, connectivity-restore triggers, and durable `deadLetter` persistence on conflicts or exhausted retries).
 - **Sqflite durable outbox adapter** (`local_remote_sqflite`):
   - Transaction-safe domain writes + outbox enqueue via `runWithTransaction` and `outboxFor(txn)` + `refreshPendingCount()`.
   - Durable SQLite outbox persistence (`sync_outbox`) with UTC timestamps, JSON payload/metadata, and indexes.
@@ -73,12 +80,21 @@ the Core — never the other way around.
   - Snapshot versioning with automatic migration, corruption detection, crash recovery, per-entity FIFO, and reactive `watchPendingCount`.
   - **Consistency limitation:** A single Hive box write is not an unconditional crash-atomic or ACID guarantee. Hive may buffer writes in memory before flushing to disk.
 
-### Planned
-- `SyncEngine` and push orchestration.
-- `RetryPolicy` implementations and retry orchestration.
-- `ConflictResolver` implementations.
-- `local_remote_supabase`, `local_remote_firestore`, `local_remote_rest`, and `local_remote_graphql` remote adapters.
-- Optional platform background scheduling integrations (out of Core scope).
+- **Remote sync adapters**:
+  - `local_remote_rest`: Generic HTTP REST push adapter (`RestRemoteSyncAdapter`, `RestEntityConfig`), sending `Idempotency-Key` and optional `If-Match` headers.
+  - `local_remote_supabase`: Supabase PostgREST push adapter (`SupabaseRemoteSyncAdapter`, `SupabaseTableConfig`).
+  - `local_remote_firestore`: Cloud Firestore push adapter (`FirestoreRemoteSyncAdapter`, `FirestoreEntityConfig`).
+  - `local_remote_graphql`: Generic GraphQL mutation push adapter (`GraphqlRemoteSyncAdapter`, `GraphqlEntityConfig`).
+
+- **Reference Flutter application** (`examples/basic_offline_first_app`):
+  - Demonstrates local-first Todo CRUD with atomic Sqflite transactions (`TodoRepository`), `SyncEngine` lifecycle management (`AppInitializer`), `ConnectivityPlusProvider`, `RestRemoteSyncAdapter` configuration, manual `syncNow()`, and reactive sync status/error reporting.
+
+### Out of Core Scope / Planned
+- Pull synchronization.
+- Automatic conflict resolution strategies (conflicts are persisted as `deadLetter` and surfaced via `SyncEngine.conflicts`).
+- Platform background scheduling integrations (e.g., WorkManager, BGTaskScheduler — background execution is platform-controlled).
+
+> **Delivery & Idempotency Note:** Retrying a failed push provides **at-least-once** delivery, not guaranteed exactly-once remote execution. Remote backends must enforce idempotency (for example, by persisting and deduplicating on `SyncOperation.idempotencyKey`) to prevent duplicate side effects.
 
 ---
 
@@ -86,14 +102,15 @@ the Core — never the other way around.
 
 | Package | Type | Responsibility | Status |
 |---|---|---|---|
-| `local_remote_synchronization` | Core (Pure Dart) | Contracts, models, enums | ✅ Phase 1 Implemented |
-| `local_remote_sqflite` | Local adapter | `LocalStorageAdapter` via Sqflite | ✅ Phase 2.1 Implemented |
-| `local_remote_drift` | Local adapter | `LocalStorageAdapter` via Drift | ✅ Phase 2.2 Implemented |
-| `local_remote_hive` | Local adapter | `LocalStorageAdapter` via Hive | ✅ Phase 2.3 Implemented |
-| `local_remote_supabase` | Remote adapter | `RemoteSyncAdapter` via Supabase | 🗓 Planned |
-| `local_remote_firestore` | Remote adapter | `RemoteSyncAdapter` via Firestore | 🗓 Planned |
-| `local_remote_rest` | Remote adapter | `RemoteSyncAdapter` via REST HTTP | 🗓 Planned |
-| `local_remote_graphql` | Remote adapter | `RemoteSyncAdapter` via GraphQL | 🗓 Planned |
+| `local_remote_synchronization` | Core (Pure Dart) | Contracts, models, enums, `SyncEngine`, `RetryPolicy` | ✅ Implemented |
+| `local_remote_sqflite` | Local adapter | `LocalStorageAdapter` via Sqflite | ✅ Implemented |
+| `local_remote_drift` | Local adapter | `LocalStorageAdapter` via Drift | ✅ Implemented |
+| `local_remote_hive` | Local adapter | `LocalStorageAdapter` via Hive | ✅ Implemented |
+| `local_remote_supabase` | Remote adapter | `RemoteSyncAdapter` via Supabase | ✅ Implemented |
+| `local_remote_firestore` | Remote adapter | `RemoteSyncAdapter` via Firestore | ✅ Implemented |
+| `local_remote_rest` | Remote adapter | `RemoteSyncAdapter` via REST HTTP | ✅ Implemented |
+| `local_remote_graphql` | Remote adapter | `RemoteSyncAdapter` via GraphQL | ✅ Implemented |
+| `basic_offline_first_app` | Reference app | End-to-end Flutter Todo example | ✅ Implemented |
 
 ---
 

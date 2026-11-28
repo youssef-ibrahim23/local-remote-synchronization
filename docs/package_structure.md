@@ -75,16 +75,12 @@ local-remote-synchronization/
 
 | Module | Folder | Responsibility |
 |---|---|---|
-| Core | `src/core/` | Shared base types, `Identifiable`, internal helpers |
-| Contracts | `src/contracts/` | `LocalStorageAdapter`, `RemoteSyncAdapter`, `ConnectivityProvider`, `ConflictResolver`, `RetryPolicy` |
-| Models | `src/models/` | `SyncOperation`, `LocalMutation`, `SyncResult`, `SyncStatus`, `SyncConfiguration`, `SyncError` |
-| Enums | `src/enums/` | `SyncOperationType`, `SyncResultStatus`, `ConflictStrategy`, `SyncState` |
-| Exceptions | `src/exceptions/` | `SyncException`, `ConflictException`, `AdapterException` |
-| Engine | `src/engine/` | `SyncEngine` (skeleton), `SyncProcessor` (skeleton) |
-| Queue | `src/queue/` | `SyncQueue` abstract class — FIFO, durable, survives restarts |
-| Scheduler | `src/scheduler/` | `SyncScheduler` skeleton |
-| Retry | `src/retry/` | `RetryPolicy` abstract class |
-| Conflict | `src/conflict/` | `ConflictResolver` abstract class |
+| Core | `src/core/` | Shared base types, internal helpers |
+| Contracts | `src/contracts/` | `LocalStorageAdapter`, `OutboxWriter`, `RemoteSyncAdapter`, `ConnectivityProvider` |
+| Models | `src/models/` | `SyncOperation`, `LocalMutation`, `SyncResult` (`SyncSuccess`, `SyncConflict`, `SyncFailure`), `SyncError` |
+| Enums | `src/enums/` | `SyncOperationType`, `SyncOperationStatus`, `SyncErrorCode` |
+| Engine | `src/engine/` | `SyncEngine`, `SyncEngineConfig`, `SyncCycleReport`, `SyncConflictEvent`, `RetryPolicy`, `ExponentialBackoffRetryPolicy` |
+| Utils | `src/utils/` | Deep-freeze immutability helpers |
 
 ---
 
