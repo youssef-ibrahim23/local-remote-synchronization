@@ -153,7 +153,7 @@ The ledger document ID is `sha256(idempotencyKey)` (hex-encoded) inside
 | `status` | string | `applied` |
 | `remoteVersion` | string? | Version returned to the client |
 | `syncedData` | map? | Acknowledged entity data |
-| `createdAt` | timestamp | Server timestamp |
+| `createdAt` | timestamp | Server timestamp — written via `FieldValue.serverTimestamp()` |
 
 **Replay:** a retry with the identical operation identity and payload returns
 the recorded `SyncSuccess` without re-applying the mutation. This protects
@@ -170,10 +170,13 @@ No credentials or tokens are stored in the ledger.
 ### Retention / TTL
 
 The adapter never deletes ledger records. You should configure a Firestore TTL
-policy on `createdAt` (or your own retention field) in the collection group so
-ledger entries expire after your sync-retry horizon — e.g. 7–30 days. Entries
-must outlive the longest plausible retry window; deleting them early re-opens
-the duplicate-application window.
+policy on the `createdAt` timestamp field (the exact field written by the
+adapter) in the ledger collection so entries expire automatically. Ledger
+retention **must exceed the maximum plausible retry horizon** — the longest
+window in which the `SyncEngine` or application could still re-deliver the
+same operation (e.g. 7–30 days, matching your retry/backoff policy). Entries
+must outlive that horizon; deleting them early re-opens the
+duplicate-application window.
 
 ---
 

@@ -388,6 +388,37 @@ void main() {
       expect((await noteData())?['title'], 'Old');
     });
 
+    test('explicit null baseVersion is rejected, not treated as absent',
+        () async {
+      await seedVersioned();
+      final result = await harness.adapter.push(
+        makeOperation(
+          type: SyncOperationType.update,
+          payload: {'title': 'x'},
+          metadata: {'baseVersion': null},
+        ),
+      );
+      expect(result, isA<SyncFailure>());
+      expect((result as SyncFailure).error.code, SyncErrorCode.validation);
+      expect(result.error.isRetryable, isFalse);
+      // The remote document must be untouched.
+      expect((await noteData())?['title'], 'Old');
+      expect((await noteData())?['sync_version'], 3);
+    });
+
+    test('omitted baseVersion still performs an unconditional update',
+        () async {
+      await seedVersioned(version: 9);
+      final result = await harness.adapter.push(
+        makeOperation(
+          type: SyncOperationType.update,
+          payload: {'title': 'New'},
+        ),
+      );
+      expect(result, isA<SyncSuccess>());
+      expect((result as SyncSuccess).remoteVersion, '10');
+    });
+
     test('double baseVersion is rejected', () async {
       await seedVersioned();
       final result = await harness.adapter.push(
@@ -440,6 +471,51 @@ void main() {
         makeOperation(type: SyncOperationType.delete),
       );
       expect(result, isA<SyncSuccess>());
+    });
+
+    test('explicit null baseVersion is rejected before any mutation', () async {
+      await harness.firestore
+          .collection('notes')
+          .doc('entity-1')
+          .set({'title': 'Bye', 'sync_version': 4});
+
+      final result = await harness.adapter.push(
+        makeOperation(
+          type: SyncOperationType.delete,
+          metadata: {'baseVersion': null},
+        ),
+      );
+      expect(result, isA<SyncFailure>());
+      expect((result as SyncFailure).error.code, SyncErrorCode.validation);
+      expect(await noteData(), isNotNull);
+    });
+
+    test('omitted baseVersion deletes a well-versioned document', () async {
+      await harness.firestore
+          .collection('notes')
+          .doc('entity-1')
+          .set({'title': 'Bye', 'sync_version': 4});
+
+      final result = await harness.adapter.push(
+        makeOperation(type: SyncOperationType.delete),
+      );
+      expect(result, isA<SyncSuccess>());
+      expect(await noteData(), isNull);
+    });
+
+    test('malformed stored version cannot be silently deleted', () async {
+      await harness.firestore
+          .collection('notes')
+          .doc('entity-1')
+          .set({'title': 'Bye', 'sync_version': 'four'});
+
+      // Even without a baseVersion, a malformed stored version violates
+      // the versioning contract — same as update behavior.
+      final result = await harness.adapter.push(
+        makeOperation(type: SyncOperationType.delete),
+      );
+      expect(result, isA<SyncConflict>());
+      expect((await noteData())?['title'], 'Bye');
     });
 
     test('versioned delete enforces expected version', () async {

@@ -335,9 +335,12 @@ final class FirestoreRemoteSyncAdapter implements RemoteSyncAdapter {
     int? expectedVersion,
   ) {
     final versionField = config.versionField;
-    if (exists && versionField != null && expectedVersion != null) {
+    if (exists && versionField != null) {
       final current = remoteData?[versionField];
-      if (current is! int || current != expectedVersion) {
+      // A malformed stored version violates the versioning contract just
+      // like a mismatched one — never silently bypass it.
+      if (current is! int ||
+          (expectedVersion != null && current != expectedVersion)) {
         return SyncConflict(
           operationId: operation.operationId,
           remoteSnapshot: remoteData ?? const {},
@@ -406,7 +409,7 @@ final class FirestoreRemoteSyncAdapter implements RemoteSyncAdapter {
         'status': 'applied',
         'remoteVersion': remoteVersion,
         'syncedData': syncedData,
-        'appliedAt': FieldValue.serverTimestamp(),
+        'createdAt': FieldValue.serverTimestamp(),
       };
 
   /// Replays a committed ledger entry. The entry only counts as the same
@@ -488,19 +491,20 @@ final class FirestoreRemoteSyncAdapter implements RemoteSyncAdapter {
   }
 
   /// Returns the expected version from operation metadata, strictly
-  /// validated: only `int` values are accepted — strings, doubles, and
-  /// null are rejected rather than coerced.
+  /// validated: an absent key means "no concurrency check", while a
+  /// present key must hold an `int` — explicit null, strings, doubles,
+  /// and other values are rejected rather than coerced.
   int? _expectedVersion(
     SyncOperation operation,
     FirestoreEntityConfig config,
   ) {
     if (config.versionField == null) return null;
+    if (!operation.metadata.containsKey(expectedVersionKey)) return null;
     final value = operation.metadata[expectedVersionKey];
-    if (value == null) return null;
     if (value is! int) {
       throw FirestoreValidationException(
-        'Expected version metadata "$expectedVersionKey" must be an int, '
-        'got ${value.runtimeType}.',
+        'Expected version metadata "$expectedVersionKey" must be an int '
+        'when present, got ${value.runtimeType}.',
       );
     }
     return value;
