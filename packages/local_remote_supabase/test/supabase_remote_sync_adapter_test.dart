@@ -350,6 +350,11 @@ void main() {
       );
 
       expect(result, isA<SyncSuccess>());
+      // remoteVersion is whatever the server returned — the adapter does
+      // not compute or increment it. Real version progression requires a
+      // database trigger (see README); these tests verify only the
+      // client-side conditional request/response contract.
+      expect((result as SyncSuccess).remoteVersion, '4');
       final requests = versioned.http.requests;
       expect(requests, hasLength(2));
       expect(requests[0].method, 'GET');
@@ -426,6 +431,11 @@ void main() {
       expect(versioned.http.requests, hasLength(3));
     });
 
+    // NOTE: an empty SELECT response is indistinguishable from an
+    // RLS-hidden row — PostgREST returns [] for both. This test verifies
+    // the documented behavior: update reports notFound for an empty
+    // response and issues no PATCH. It does NOT prove the row is absent;
+    // the session may simply lack SELECT visibility (see README).
     test('update on missing row returns notFound', () async {
       harness.http.enqueueJson(200, <Map<String, dynamic>>[]);
       final result = await harness.adapter.push(
@@ -513,6 +523,30 @@ void main() {
         makeOperation(type: SyncOperationType.delete),
       );
       expect(result, isA<SyncSuccess>());
+    });
+
+    // Delete idempotency semantics (Option A — documented, not ledgered):
+    // the row is gone after a successful delete, so its idempotency key
+    // cannot be retained. A retried delete of the same entityId is a
+    // no-op success because the row is absent — this is NOT proof that a
+    // delete idempotency key was persisted. Entity IDs must never be
+    // reused while an old delete could still be retried; see README.
+    test('retried delete after success is an idempotent no-op', () async {
+      final operation = makeOperation(type: SyncOperationType.delete);
+      harness.http
+        // First attempt deletes the row.
+        ..enqueueJson(200, [noteRow()])
+        // Retry finds nothing left to delete.
+        ..enqueueJson(200, <Map<String, dynamic>>[]);
+
+      final first = await harness.adapter.push(operation);
+      final second = await harness.adapter.push(operation);
+
+      expect(first, isA<SyncSuccess>());
+      expect(second, isA<SyncSuccess>());
+      expect(second.operationId, operation.operationId);
+      expect(harness.http.requests, hasLength(2));
+      expect(harness.http.requests[1].method, 'DELETE');
     });
 
     test('versioned delete enforces expected version', () async {

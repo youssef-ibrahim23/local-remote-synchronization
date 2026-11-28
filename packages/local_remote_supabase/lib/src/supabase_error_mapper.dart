@@ -41,11 +41,10 @@ abstract final class SupabaseErrorMapper {
       statusCode = _parseStatus(error.statusCode);
       message = 'Supabase authentication request failed: ${error.message}';
     } else if (error is AuthException) {
-      final status = _parseStatus(error.statusCode);
-      code =
-          status == 403 ? SyncErrorCode.forbidden : SyncErrorCode.unauthorized;
-      retryable = false;
-      statusCode = status;
+      final mapped = _mapAuthException(error);
+      code = mapped.code;
+      retryable = mapped.retryable;
+      statusCode = mapped.statusCode;
       message = 'Supabase authentication failed: ${error.message}';
     } else if (error is RequestAbortedException) {
       // Checked before ClientException: RequestAbortedException is a
@@ -91,6 +90,47 @@ abstract final class SupabaseErrorMapper {
   static int? _parseStatus(String? statusCode) {
     if (statusCode == null) return null;
     return int.tryParse(statusCode);
+  }
+
+  /// Maps [AuthException] by its HTTP status code. Auth errors without a
+  /// recognisable status (including `null`) are `unknown` and
+  /// non-retryable — only `AuthRetryableFetchException` (handled
+  /// earlier) is treated as a retryable transport failure.
+  static ({SyncErrorCode code, bool retryable, int? statusCode})
+      _mapAuthException(AuthException error) {
+    final status = _parseStatus(error.statusCode);
+    return switch (status) {
+      401 => (
+          code: SyncErrorCode.unauthorized,
+          retryable: false,
+          statusCode: status,
+        ),
+      403 => (
+          code: SyncErrorCode.forbidden,
+          retryable: false,
+          statusCode: status,
+        ),
+      429 => (
+          code: SyncErrorCode.rateLimited,
+          retryable: true,
+          statusCode: status,
+        ),
+      400 || 422 => (
+          code: SyncErrorCode.validation,
+          retryable: false,
+          statusCode: status,
+        ),
+      _ when status != null && status >= 500 && status <= 599 => (
+          code: SyncErrorCode.serverError,
+          retryable: true,
+          statusCode: status,
+        ),
+      _ => (
+          code: SyncErrorCode.unknown,
+          retryable: false,
+          statusCode: status,
+        ),
+    };
   }
 
   static ({SyncErrorCode code, bool retryable, int? statusCode}) _mapPostgrest(

@@ -52,25 +52,38 @@ void main() {
   });
 
   group('auth errors', () {
-    test('AuthException → unauthorized, non-retryable', () {
-      final error =
-          errorOf(const AuthException('invalid JWT', statusCode: '401'));
-      expect(error.code, SyncErrorCode.unauthorized);
-      expect(error.isRetryable, isFalse);
-      expect(error.statusCode, 401);
-    });
+    for (final (status, expected, retryable) in [
+      ('401', SyncErrorCode.unauthorized, false),
+      ('403', SyncErrorCode.forbidden, false),
+      ('429', SyncErrorCode.rateLimited, true),
+      ('500', SyncErrorCode.serverError, true),
+      ('503', SyncErrorCode.serverError, true),
+      ('400', SyncErrorCode.validation, false),
+      ('422', SyncErrorCode.validation, false),
+      ('418', SyncErrorCode.unknown, false),
+      (null, SyncErrorCode.unknown, false),
+      ('not-a-status', SyncErrorCode.unknown, false),
+    ]) {
+      test('AuthException status "$status" → ${expected.name}', () {
+        final error =
+            errorOf(AuthException('auth failure', statusCode: status));
+        expect(error.code, expected);
+        expect(error.isRetryable, retryable);
+        expect(error.statusCode, int.tryParse(status ?? ''));
+      });
+    }
 
-    test('AuthException 403 → forbidden', () {
-      final error =
-          errorOf(const AuthException('forbidden', statusCode: '403'));
-      expect(error.code, SyncErrorCode.forbidden);
-    });
+    test('AuthApiException follows the same status mapping', () {
+      final forbidden = errorOf(
+        const AuthApiException('denied', statusCode: '403'),
+      );
+      expect(forbidden.code, SyncErrorCode.forbidden);
 
-    test('AuthApiException → unauthorized', () {
-      final error =
-          errorOf(const AuthApiException('bad request', statusCode: '400'));
-      expect(error.code, SyncErrorCode.unauthorized);
-      expect(error.isRetryable, isFalse);
+      final rateLimited = errorOf(
+        const AuthApiException('slow down', statusCode: '429'),
+      );
+      expect(rateLimited.code, SyncErrorCode.rateLimited);
+      expect(rateLimited.isRetryable, isTrue);
     });
   });
 
