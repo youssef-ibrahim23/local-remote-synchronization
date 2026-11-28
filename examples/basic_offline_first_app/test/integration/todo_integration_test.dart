@@ -102,6 +102,19 @@ void main() {
       expect(rows.single['completed'], 1);
     });
 
+    test('updating a missing todo throws StateError and enqueues nothing',
+        () async {
+      final h = _Harness();
+      await h.open();
+      addTearDown(h.dispose);
+
+      const missing = Todo(id: 'does-not-exist', title: 'Missing');
+      await expectLater(h.repo.update(missing), throwsStateError);
+
+      expect(await h.db.query('todos'), isEmpty);
+      expect(await h.outboxCount(), 0);
+    });
+
     test('deleting a todo enqueues a delete operation', () async {
       final h = _Harness();
       await h.open();

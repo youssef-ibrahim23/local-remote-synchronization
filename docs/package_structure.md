@@ -10,16 +10,11 @@ local-remote-synchronization/
 │   │   ├── lib/
 │   │   │   ├── local_remote_synchronization.dart   Public barrel export
 │   │   │   └── src/
-│   │   │       ├── core/          Base types, internal utilities
-│   │   │       ├── contracts/     Abstract interfaces (5 contracts)
-│   │   │       ├── models/        Typed data classes
-│   │   │       ├── enums/         Domain enumerations
-│   │   │       ├── exceptions/    Typed exception hierarchy
-│   │   │       ├── engine/        SyncEngine / SyncProcessor skeletons
-│   │   │       ├── queue/         SyncQueue abstraction
-│   │   │       ├── scheduler/     SyncScheduler skeleton
-│   │   │       ├── retry/         RetryPolicy abstraction
-│   │   │       └── conflict/      ConflictResolver abstraction
+│   │   │       ├── contracts/     Abstract interfaces (LocalStorageAdapter, OutboxWriter, RemoteSyncAdapter, ConnectivityProvider)
+│   │   │       ├── models/        Immutable data classes (SyncOperation, LocalMutation, SyncResult, SyncError)
+│   │   │       ├── enums/         Domain enumerations (SyncOperationType, SyncOperationStatus, SyncErrorCode)
+│   │   │       ├── engine/        SyncEngine, SyncEngineConfig, RetryPolicy, ExponentialBackoffRetryPolicy, SyncCycleReport, SyncConflictEvent
+│   │   │       └── utils/         Deep-freeze immutability helpers
 │   │   ├── test/
 │   │   └── example/
 │   │

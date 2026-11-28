@@ -58,10 +58,11 @@ final class TodoAppState extends ChangeNotifier {
 
   // ── Engine wiring ──────────────────────────────────────────────────────────
 
-  /// Attaches a started [SyncEngine] and subscribes to its streams.
+  /// Attaches [engine] and subscribes to its streams.
   ///
-  /// The engine must already have had [SyncEngine.start] called.
-  /// Call this once after `AppInitializer` starts the engine.
+  /// Should be called before [SyncEngine.start] so that no initial sync report
+  /// or conflict event is missed. [syncNow] remains unavailable until
+  /// [SyncEngine.isRunning] becomes `true`.
   void attachEngine(SyncEngine engine, Stream<int> pendingCountStream) {
     _engine = engine;
 

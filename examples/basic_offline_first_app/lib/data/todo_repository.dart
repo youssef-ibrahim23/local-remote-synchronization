@@ -87,14 +87,20 @@ final class TodoRepository {
 
   /// Updates [todo] in the local `todos` table and enqueues an `update`
   /// [SyncOperation] in the outbox, atomically.
+  ///
+  /// Throws [StateError] if no row with `todo.id` exists in `todos`, rolling
+  /// back the transaction so no outbox operation is enqueued.
   Future<SyncOperation> update(Todo todo) =>
       _storage.runWithTransaction((txn, outbox) async {
-        await txn.update(
+        final updatedRows = await txn.update(
           _table,
           _toRow(todo),
           where: 'id = ?',
           whereArgs: <Object?>[todo.id],
         );
+        if (updatedRows == 0) {
+          throw StateError('Todo "${todo.id}" does not exist.');
+        }
         return outbox.enqueue(
           LocalMutation(
             entityType: 'todos',

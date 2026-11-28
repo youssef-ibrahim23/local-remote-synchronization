@@ -1,3 +1,4 @@
+import 'package:http/http.dart' as http;
 import 'package:local_remote_rest/local_remote_rest.dart';
 
 /// REST endpoint configuration for the Todo entity type.
@@ -45,9 +46,13 @@ const String todoRestBaseUrl = String.fromEnvironment(
 ///
 /// [baseUrl] defaults to [todoRestBaseUrl] and can be overridden in tests.
 /// [defaultHeaders] is for auth tokens — never store real secrets here.
+/// When [httpClient] is omitted, the adapter creates and owns its own client
+/// (which is closed when [RestRemoteSyncAdapter.close] is called). When
+/// [httpClient] is provided, the caller retains ownership of it.
 RestRemoteSyncAdapter buildRestAdapter({
   String baseUrl = todoRestBaseUrl,
   Map<String, String> defaultHeaders = const {},
+  http.Client? httpClient,
 }) =>
     RestRemoteSyncAdapter(
       baseUrl: baseUrl,
@@ -58,5 +63,6 @@ RestRemoteSyncAdapter buildRestAdapter({
           idField: 'id', // adapter injects entityId into the payload body
         ),
       },
+      httpClient: httpClient,
       defaultHeaders: defaultHeaders,
     );

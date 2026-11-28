@@ -171,7 +171,7 @@ No device or real backend is required.
 
 ```sh
 cd examples/basic_offline_first_app
-flutter test test/integration/todo_integration_test.dart
+flutter test
 ```
 
 ---
@@ -182,22 +182,29 @@ flutter test test/integration/todo_integration_test.dart
 AppInitializer.start()
   ├── opens SQLite database
   ├── SqfliteLocalStorageAdapter.ensureInitialized()
-  ├── SyncEngine(localStorage, remoteSync, connectivity, config, retryPolicy)
+  ├── builds RestRemoteSyncAdapter (retains reference for disposal)
+  ├── creates SyncEngine(localStorage, remoteSync, connectivity, ...)
+  ├── TodoAppState.attachEngine(engine, watchPendingCount())
+  │     ├── subscribes SyncEngine.reports   → updates UI sync summary
+  │     ├── subscribes SyncEngine.conflicts → surfaces conflict messages
+  │     └── subscribes watchPendingCount    → shows outbox badge
   └── SyncEngine.start()         ← recovers stale inFlight ops
                                    subscribes connectivity
                                    triggers initial sync if online
 
-TodoAppState.attachEngine(engine, pendingCountStream)
-  ├── subscribes SyncEngine.reports   → updates UI sync summary
-  ├── subscribes SyncEngine.conflicts → surfaces conflict messages
-  └── subscribes watchPendingCount    → shows outbox badge
-
-AppInitializer.dispose()          ← call on app exit
+AppInitializer.dispose()          ← idempotent; also runs on partial start failure
   ├── TodoAppState.dispose()      ← cancels stream subscriptions
   ├── SyncEngine.dispose()        ← waits for active cycle; closes streams
+  ├── RestRemoteSyncAdapter.close() ← closes owned HTTP client (if not injected)
   ├── SqfliteLocalStorageAdapter.dispose()
   └── Database.close()
 ```
+
+> **Lifecycle note:** In `main.dart`, `AppInitializer.dispose()` is wired to the
+> root widget's `State.dispose()`. Flutter widget disposal is **not** a
+> guaranteed process-shutdown callback (the OS can terminate the process without
+> running `dispose()`). Crash recovery relies on the durable SQLite outbox and
+> `SyncEngine.start()` recovering any stale `inFlight` operations on next launch.
 
 ---
 
